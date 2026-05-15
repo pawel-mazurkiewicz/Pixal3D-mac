@@ -335,11 +335,28 @@ def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img=None, o
     import trimesh
     from PIL import Image
 
+    # Force the base-color texture to RGBA with alpha=255 *everywhere* and
+    # render it via PIL in RGBA mode.  trimesh / pygltflib otherwise lets
+    # the GLB importer (Blender, three.js, ...) infer transparency for
+    # unfilled gutter texels, making the model look like an x-ray render.
+    # The metallic-roughness texture stays RGB — that one doesn't get an
+    # alpha interpretation downstream.
+    if base_color_img.ndim == 3 and base_color_img.shape[-1] == 3:
+        h, w, _ = base_color_img.shape
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = base_color_img
+        rgba[..., 3] = 255
+        base_color_pil = Image.fromarray(rgba, mode="RGBA")
+    else:
+        base_color_pil = Image.fromarray(base_color_img)
+
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=Image.fromarray(base_color_img),
+        baseColorTexture=base_color_pil,
         metallicFactor=0.0,
         roughnessFactor=0.8,
+        alphaMode="OPAQUE",
+        doubleSided=True,
     )
     if mr_img is not None:
         material.metallicRoughnessTexture = Image.fromarray(mr_img)

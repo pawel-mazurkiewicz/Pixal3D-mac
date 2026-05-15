@@ -71,17 +71,24 @@ IMAGE_COND_CONFIGS = {
     },
 }
 
-# Pixal3D's mesh extractor already outputs in Y-up convention (glTF-native),
-# so no rotation is needed for export — the pre-rotation AABB has its
-# tallest extent on Y.  The previous matrix here was a bogus 180-degree
-# rotation around (0, 1, -1) that flipped X horizontally AND swapped Y/Z
-# with sign flips, leaving the model lying on its side AND mirrored.
-# Identity matrix below preserves Pixal3D's native orientation.
+# Pixal3D's mesh extractor outputs Y-up (matches glTF), but the reference
+# CUDA pipeline (o_voxel.postprocess.to_glb) Y-flips the mesh before
+# writing — confirmed by diffing AABBs of the official HF-demo output
+# vs ours.  Our exports therefore need a single-axis Y reflection to land
+# in the same orientation.  Because a reflection has det = -1 (face
+# winding would flip and normals would point inward), `rotated_vertices`
+# also reverses the face winding so the mesh stays correctly oriented.
 EXPORT_ROTATION_ROWS = [
-    [1, 0, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1],
+    # Negate glTF Z (depth axis).  Blender's importer converts glTF Y-up
+    # to Z-up via a 90° rotation around X, which maps glTF +Z to Blender
+    # -Y — so negating glTF Z corresponds to flipping the "facing" of the
+    # model toward/away from the default Blender front-view camera.
+    # That's what Pixal3D's reference pipeline does and what we need to
+    # match the HF demo's orientation.
+    [1, 0,  0, 0],
+    [0, 1,  0, 0],
+    [0, 0, -1, 0],
+    [0, 0,  0, 1],
 ]
 EXPORT_ROTATION = None
 
@@ -328,6 +335,57 @@ def rotated_vertices(vertices: np.ndarray) -> np.ndarray:
     return vertices @ EXPORT_ROTATION[:3, :3].T + EXPORT_ROTATION[:3, 3]
 
 
+def _apply_export_rotation_to_mesh(vertices: np.ndarray, faces: np.ndarray, mesh):
+    """Apply EXPORT_ROTATION to the mesh AND to the voxel attribute coords
+    in one shot.  When the rotation includes a reflection (det < 0), the
+    face winding is reversed so face normals continue to point outward.
+
+    This must be called *before* UV unwrap and texture bake so that the
+    cube projection, KDTree query, and final GLB export all operate in
+    the same coordinate frame.  Otherwise the bake would fill texels using
+    pre-rotation 3D positions while the exported vertices sit at post-
+    rotation positions — texel content would land on the wrong faces
+    (e.g. roof voxel attrs showing on the floor of the rendered mesh).
+    """
+    R = EXPORT_ROTATION[:3, :3]
+    det = np.linalg.det(R)
+
+    new_vertices = (vertices @ R.T).astype(np.float32)
+    if det < 0:
+        # Reflection: reverse triangle winding so outward normals stay outward.
+        new_faces = faces[:, [0, 2, 1]].astype(faces.dtype)
+    else:
+        new_faces = faces
+
+    # Rotate voxel data so the KDTree query in bake_texture finds the right
+    # voxel for each (post-rotation) face position.  voxel_world is computed
+    # as coords * vs + origin + vs/2.  After rotation:
+    #   new_world = R @ old_world
+    #             = R @ (coords*vs + origin + vs/2 * 1)
+    #             = (coords @ R.T) * vs + (origin @ R.T) + vs/2 * (1 @ R.T)
+    # which we can reconstruct by setting:
+    #   new_coords = coords @ R.T
+    #   new_origin = origin @ R.T + vs/2 * (R @ 1 - 1)
+    coords_np = mesh.coords.detach().cpu().numpy().astype(np.float32)
+    origin_np = mesh.origin.detach().cpu().numpy().astype(np.float32)
+    vs = float(mesh.voxel_size)
+
+    rotated_coords = coords_np @ R.T
+    ones = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    origin_correction = 0.5 * vs * (ones @ R.T - ones)
+    rotated_origin = origin_np @ R.T + origin_correction
+
+    rotated_mesh = _LoadedMesh()
+    rotated_mesh.vertices = torch.from_numpy(new_vertices)
+    rotated_mesh.faces = torch.from_numpy(new_faces)
+    rotated_mesh.coords = torch.from_numpy(rotated_coords)
+    rotated_mesh.attrs = mesh.attrs
+    rotated_mesh.origin = torch.from_numpy(rotated_origin)
+    rotated_mesh.voxel_size = vs
+
+    return new_vertices, new_faces, rotated_mesh
+
+
 def simplify_vertices_faces(vertices: np.ndarray, faces: np.ndarray, target_faces: int):
     if len(faces) <= target_faces:
         return vertices, faces
@@ -375,7 +433,16 @@ def patch_o_voxel_grid_sample_if_needed(postprocess_module):
 def export_geometry_only(vertices: np.ndarray, faces: np.ndarray, glb_path: Path):
     import trimesh
 
-    mesh = trimesh.Trimesh(vertices=rotated_vertices(vertices), faces=faces, process=False)
+    # Match the texture path's coordinate convention: rotate via
+    # EXPORT_ROTATION and, for reflections (det < 0), reverse face winding
+    # so outward normals remain outward.
+    R = EXPORT_ROTATION[:3, :3]
+    out_vertices = rotated_vertices(vertices)
+    if np.linalg.det(R) < 0:
+        out_faces = faces[:, [0, 2, 1]]
+    else:
+        out_faces = faces
+    mesh = trimesh.Trimesh(vertices=out_vertices, faces=out_faces, process=False)
     mesh.export(str(glb_path))
     print(f"[Export] Geometry-only GLB saved to {glb_path}")
 
@@ -433,6 +500,12 @@ def export_fallback_texture_glb(mesh, vertices: np.ndarray, faces: np.ndarray, g
         _find_blender_exe, bake_texture, export_glb_with_texture, uv_unwrap,
     )
 
+    # Apply EXPORT_ROTATION up front: rotate the mesh AND the voxel attribute
+    # frame together so the UV unwrap, bake, and final GLB write all operate
+    # in the same coordinate system.  See _apply_export_rotation_to_mesh's
+    # docstring for the math behind the origin correction.
+    vertices, faces, mesh = _apply_export_rotation_to_mesh(vertices, faces, mesh)
+
     target_faces = min(args.bake_face_target, len(faces))
 
     # Decide whether Blender will handle decimation+unwrap end-to-end.  When
@@ -447,9 +520,6 @@ def export_fallback_texture_glb(mesh, vertices: np.ndarray, faces: np.ndarray, g
     )
 
     if args.skip_decimation:
-        # Full-fidelity path: don't decimate at all.  Blender script still
-        # runs cleanup (remove_doubles + dissolve_degenerate) but doesn't
-        # apply Decimate or voxel remesh.
         bake_vertices, bake_faces = vertices, faces
         target_count_for_uv = None
         voxel_size_for_uv = None
@@ -487,8 +557,10 @@ def export_fallback_texture_glb(mesh, vertices: np.ndarray, faces: np.ndarray, g
         texture_size=args.texture_size,
         search_voxels=args.bake_search_voxels,
     )
+    # Vertices were already rotated above — write directly.  No second pass
+    # through rotated_vertices().
     export_glb_with_texture(
-        rotated_vertices(new_vertices),
+        new_vertices,
         new_faces,
         uvs,
         base_color_img,

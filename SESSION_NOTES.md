@@ -119,7 +119,7 @@ CLI: `--bake-face-target N` (default 100000 — best-effort target),
 `--skip-decimation` (bake on the full 8.4M-face mesh), `--voxel-remesh-size F`
 (opt-in for watertight inputs).
 
-### 9. Export rotation
+### 9. Export rotation (revised twice)
 The original `EXPORT_ROTATION_ROWS` matrix was a bogus 180° rotation around
 the `(0, 1, -1)` axis: it negated X and swapped Y↔Z with sign flips,
 putting the mesh upside-down AND mirrored.
@@ -130,9 +130,38 @@ distribution along the tall axis. The mesh's *pre-rotation* AABB has Y as
 the tallest axis (extent 0.88), confirming **Pixal3D outputs Y-up
 natively** (same as glTF). No rotation is needed.
 
-**Fix:** set `EXPORT_ROTATION_ROWS` to identity.
+**Initial fix:** set `EXPORT_ROTATION_ROWS` to identity.
 
-### 10. cube_project UV overlap (NOT YET FULLY SOLVED — see "Next" below)
+**Round 2 (after diffing against the official HF demo's GLB):** Pixal3D's
+CUDA `o_voxel.postprocess.to_glb` applies a Z-axis flip (in glTF coords)
+that we weren't doing.  The HF demo's AABB had `y = [-0.37, 0.28]` in
+Blender (heavy mass toward camera) while ours had `y = [-0.24, 0.36]`
+(heavy mass away from camera) — exact mirror.  Fixed by setting
+`EXPORT_ROTATION_ROWS` to negate glTF Z, **and** flipping face winding in
+`rotated_vertices` and `_apply_export_rotation_to_mesh` (a reflection has
+det = -1; without winding flip, face normals point inward and the model
+goes invisible under backface culling).  The rotation is now applied
+*early* in both export paths — to vertices AND to the voxel attribute
+coordinate frame — so the cube projection, KDTree query, and final GLB
+all see the same rotated coordinates.  Math for the voxel-frame rotation
+is in `_apply_export_rotation_to_mesh`'s docstring.
+
+### 10. Alpha = 0 made the mesh look x-ray
+After fixing rotation, the rendered fairy house in Blender Material
+Preview looked **transparent** — towers visible only as silhouettes, you
+could see through to the back of the model.  Cause: the baked
+`base_color_img` is RGB (`(H, W, 3)`), but trimesh / pygltflib expand it
+to RGBA on GLB write, with alpha = 0 in unfilled gutter texels.
+glTF viewers honoured that as transparency even with default
+`alphaMode = OPAQUE`.
+
+**Fix in `export_glb_with_texture`:** explicitly compose RGBA with
+`alpha = 255` everywhere, hand to PIL in RGBA mode, set
+`alphaMode = OPAQUE` and `doubleSided = True` on the material.  The
+"x-ray" disappeared immediately and ~20% coverage texture now shows up
+as grayscale fallback where no texture data exists, instead of holes.
+
+### 11. cube_project UV overlap (FIXED but the approach is fundamentally wrong — see verdict below)
 `bpy.ops.uv.cube_project` in Blender 5.x just does flat planar projection
 per face — every face direction lands in the same `[-0.5, 0.5]²` region.
 Confirmed by partitioning faces by normal direction in the loaded GLB:
@@ -147,6 +176,60 @@ own atlas slot. Two-row layout: 3 "big" buckets on top, 3 "small"
 buckets on the bottom, slot WIDTH proportional to face count within
 each row (Pixal3D's image-to-3D produces a ~90:10 face-direction split,
 so equal-area slots over-stuff three charts and waste the other three).
+
+## Verdict on the current UV strategy: not viable
+
+After comparing our output to the **official Pixal3D HF-demo GLB** for the
+same input image, the conclusion is that **cube projection is the wrong
+approach entirely** for this model class.  GT's atlas is a dense,
+tightly-packed mosaic of ~thousand-plus small UV islands covering most
+of a 4096² canvas (clearly `cumesh.uv_unwrap` output: angle-clustered
+small charts with proper bin packing).  Ours is 6 axis-aligned
+projection slabs occupying ~20% of a 2048² canvas with most of the
+atlas empty.  The geometry is correct, the alpha is correct, the
+orientation is correct — but the *surface look* is unusable: where the
+GT shows a textured fairy house with blue roof shingles, brown trunk,
+green foliage and PBR sheen, ours shows the right geometry painted in
+the right colours but at sub-pixel density, so it reads as a grayscale
+projection with sparse colour hints.
+
+Visually compared side-by-side in Blender: the user verdict was
+"they don't look ANYTHING alike … it's not usable in any shape or form
+now".  Agreed.
+
+So cube projection is dead.  Next session needs a different UV
+unwrapper.  The path forward (best/worst case ordered by realism):
+
+1. **Decimate to ~200k faces, then xatlas at our relaxed
+   `max_cost=1.0`.**  xatlas produces dense small charts naturally; at
+   200k faces with that setting it runs in ~3-5 min and packs into a
+   4096² atlas at ~6 texels per face.  The blocker is **decimation**:
+   `fast_simplification` floors at ~920k and Blender Decimate-Collapse
+   floors at ~2.76M, both because they refuse to collapse non-manifold
+   edges.  Real fix: switch decimator.  Candidates:
+   - **`pymeshlab`** — bundled QEM is much more tolerant of bad
+     topology.  Pure Python wheel exists for macOS arm64.  This is
+     the cheapest experiment.
+   - **`pyfqmr`** — also lighter on topology constraints.
+   - **trimesh.repair.fill_holes() before decimation** — close the
+     non-manifold edges first, then existing decimators can collapse.
+   - Last resort: roll our own QEM that ignores non-manifold rules.
+2. **Port `cumesh.uv_unwrap` to PyTorch/MPS.**  This is the "right"
+   answer that would produce a GT-equivalent atlas.  Real engineering
+   work — the algorithm is angle-cluster + region-grow + parameterise
+   + pack, none of which is trivial.  Estimate: 1-2 weeks.  Worth it
+   only if Pixal3D becomes the daily-driver pipeline on Mac.
+3. **Vertex colours fallback** (`--vertex-colors`, not yet
+   implemented).  Skip the UV/atlas problem entirely; bake voxel
+   attrs to per-vertex colour.  At ~1.9M vertices that's roughly a
+   1378² atlas equivalent.  Visual quality is "OK for preview" but
+   not PBR-grade.  Cheap to implement (~half a day) — useful as an
+   "always works" fallback and for fast iteration.
+
+The current code-path is committed in this state mainly as a
+checkpoint: it gets the mesh out, gets orientation right, gets the
+alpha right, gets the bake working, but **the cube_project step is
+slated for removal next session**.
 
 ## Texture quality — what's still off
 
