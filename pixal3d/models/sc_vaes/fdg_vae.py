@@ -17,7 +17,22 @@ from .sparse_unet_vae import (
     SparseUnetVaeDecoder,
 )
 from ...representations import Mesh
-from o_voxel.convert import flexible_dual_grid_to_mesh
+try:
+    from o_voxel.convert import flexible_dual_grid_to_mesh as _native_flexible_dual_grid_to_mesh
+except (ImportError, RuntimeError, OSError):
+    _native_flexible_dual_grid_to_mesh = None
+from ...utils.mesh_extract import flexible_dual_grid_to_mesh as _torch_flexible_dual_grid_to_mesh
+
+
+def flexible_dual_grid_to_mesh(*args, **kwargs):
+    coords = args[0] if args else kwargs.get('coords')
+    if (
+        _native_flexible_dual_grid_to_mesh is not None
+        and isinstance(coords, torch.Tensor)
+        and coords.device.type == 'cuda'
+    ):
+        return _native_flexible_dual_grid_to_mesh(*args, **kwargs)
+    return _torch_flexible_dual_grid_to_mesh(*args, **kwargs)
 
 
 class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):

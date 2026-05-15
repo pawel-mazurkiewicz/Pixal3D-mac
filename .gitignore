@@ -6,7 +6,19 @@ __pycache__/
 
 # Output files
 output.glb
+output_3d*.glb
+output_3d*.obj
 autotune_cache.json
+
+# Local iteration artefacts (kept out of git so checkpoints / debug dumps
+# don't get committed by accident — they're regenerated on demand)
+checkpoints/
+xatlas.txt
+*_basecolor*.png
+
+# OMC / session state
+.omc/
+.claude/
 
 # Virtual environment
 venv/
@@ -16,6 +28,7 @@ env/
 # IDE
 .idea/
 .vscode/
+.serena/
 *.swp
 *.swo
 

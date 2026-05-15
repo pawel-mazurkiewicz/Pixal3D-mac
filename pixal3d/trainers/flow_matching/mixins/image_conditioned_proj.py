@@ -411,6 +411,10 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         self.proj_channels = self.embed_dim * 2 if use_naf_upsample else self.embed_dim
         
         # NOTE: proj_linear removed — now lives in each denoiser block's ProjectAttention
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.model.parameters()).device
     
     def _load_naf(self):
         """Lazy-load pretrained NAF model."""
@@ -453,7 +457,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for layer_module in self.model.layer:
+        layers = self.model.model.layer if hasattr(self.model, 'model') and hasattr(self.model.model, 'layer') else self.model.layer
+        for layer_module in layers:
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -488,12 +493,13 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         # Handle input types
         if isinstance(image, torch.Tensor):
             assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
+            image = image.to(self.device)
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -667,6 +673,10 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         self.vae_proj_channels = self.vae_channels     # 16
         # proj_channels is kept for backward compat with _proj_channels in mixin
         self.proj_channels = self.embed_dim
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.dino_model.parameters()).device
         
     def _load_vae(self):
         """Lazy-load Flux VAE encoder."""
@@ -713,7 +723,8 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         image = image.to(self.dino_model.embeddings.patch_embeddings.weight.dtype)
         hidden_states = self.dino_model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.dino_model.rope_embeddings(image)
-        for layer_module in self.dino_model.layer:
+        layers = self.dino_model.model.layer if hasattr(self.dino_model, 'model') and hasattr(self.dino_model.model, 'layer') else self.dino_model.layer
+        for layer_module in layers:
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -751,12 +762,13 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         # Handle input types
         if isinstance(image, torch.Tensor):
             assert image.ndim == 4
+            image = image.to(self.device)
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image)
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         

@@ -1,8 +1,11 @@
 from typing import *
 
-CONV = 'flex_gemm' 
+CONV = 'flex_gemm'
 DEBUG = False
 ATTN = 'flash_attn'
+
+VALID_CONV_BACKENDS = ['none', 'spconv', 'torchsparse', 'flex_gemm']
+VALID_ATTN_BACKENDS = ['xformers', 'flash_attn', 'flash_attn_3', 'flash_attn_4', 'sdpa', 'naive']
 
 def __from_env():
     import os
@@ -17,11 +20,11 @@ def __from_env():
     if env_sparse_attn_backend is None:
         env_sparse_attn_backend = os.environ.get('ATTN_BACKEND')
 
-    if env_sparse_conv_backend is not None and env_sparse_conv_backend in ['none', 'spconv', 'torchsparse', 'flex_gemm']:
+    if env_sparse_conv_backend is not None and env_sparse_conv_backend in VALID_CONV_BACKENDS:
         CONV = env_sparse_conv_backend
     if env_sparse_debug is not None:
         DEBUG = env_sparse_debug == '1'
-    if env_sparse_attn_backend is not None and env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3', 'flash_attn_4', 'sdpa']:
+    if env_sparse_attn_backend is not None and env_sparse_attn_backend in VALID_ATTN_BACKENDS:
         ATTN = env_sparse_attn_backend
         
     print(f"[SPARSE] Conv backend: {CONV}; Attention backend: {ATTN}")
@@ -38,6 +41,6 @@ def set_debug(debug: bool):
     global DEBUG
     DEBUG = debug
 
-def set_attn_backend(backend: Literal['xformers', 'flash_attn', 'flash_attn_3', 'flash_attn_4', 'sdpa']):
+def set_attn_backend(backend: Literal['xformers', 'flash_attn', 'flash_attn_3', 'flash_attn_4', 'sdpa', 'naive']):
     global ATTN
     ATTN = backend
