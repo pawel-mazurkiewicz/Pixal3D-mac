@@ -23,6 +23,166 @@ import o_voxel
 MOGE_MODEL_NAME = "Ruicheng/moge-2-vitl"
 MODEL_PATH = "TencentARC/Pixal3D"
 
+# ============================================================================
+# Fixture capture (CUDA-vs-MPS divergence analysis)
+# ============================================================================
+#
+# Set PIXAL3D_DUMP_FIXTURES=/path/to/dir to dump intermediate tensors at every
+# pipeline stage boundary.  Same dump format on CUDA and MPS — diff stage-by-
+# stage to localise where the two backends first numerically diverge.
+#
+# Fixtures written (when enabled):
+#   00_metadata.json         host/device/seed/image-SHA + args, on success
+#   00_preprocessed_image.pt PIL image after rembg / square-pad
+#   01_camera_params.pt      MoGe (or manual) camera dict
+#   02_sparse_structure.pt   sample_sparse_structure() output
+#   03a_shape_slat.pt        sample_shape_slat() output (non-cascade path)
+#   03b_shape_slat_cascade.pt sample_shape_slat_cascade() output (cascade path)
+#   04_shape_slat_decoded.pt decode_shape_slat() output
+#   05_tex_slat.pt           sample_tex_slat() output
+#   06_tex_slat_decoded.pt   decode_tex_slat() output
+#   07_run_output.pt         pipeline.run() outer return — mesh + latents
+#   08_to_glb_geometry.pt    o_voxel.postprocess.to_glb() result (geometry only)
+#
+# All tensors are detached + moved to CPU before saving so the .pt files are
+# portable across devices.  Multi-call methods get a `_call{N}` suffix.
+#
+PIXAL3D_DUMP_FIXTURES = os.environ.get("PIXAL3D_DUMP_FIXTURES", "").strip()
+
+
+def _fixture_to_cpu(x):
+    """Recursively detach + move tensors to CPU for portable fixture saves."""
+    if torch.is_tensor(x):
+        return x.detach().cpu()
+    if isinstance(x, dict):
+        return {k: _fixture_to_cpu(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_fixture_to_cpu(v) for v in x)
+    # Common non-tensor objects we want to capture by introspection
+    if hasattr(x, "vertices") and hasattr(x, "faces"):
+        # mesh-like (MeshWithVoxel from pipeline, trimesh.Geometry, etc.)
+        out = {}
+        for attr in ("vertices", "faces", "attrs", "coords", "uv",
+                     "vertex_normals", "face_normals", "visual"):
+            if hasattr(x, attr):
+                v = getattr(x, attr)
+                if v is not None:
+                    try:
+                        out[attr] = _fixture_to_cpu(v)
+                    except Exception:
+                        pass
+        out["_repr"] = repr(x)[:200]
+        return out
+    return x
+
+
+def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
+    """Save a fixture under <fixture_dir>/<name>.pt.  No-op if disabled."""
+    target = fixture_dir if fixture_dir is not None else PIXAL3D_DUMP_FIXTURES
+    if not target:
+        return
+    os.makedirs(target, exist_ok=True)
+    out = os.path.join(target, f"{name}.pt")
+    try:
+        torch.save(_fixture_to_cpu(payload), out)
+        sz = os.path.getsize(out)
+        print(f"[fixture] {name} -> {out} ({sz / 1e6:.2f} MB)", flush=True)
+    except Exception as exc:
+        print(f"[fixture] WARN failed to dump {name}: {exc}", flush=True)
+
+
+def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
+    """Monkey-patch pipeline stage methods to dump outputs after each call.
+
+    Each method may be invoked more than once per inference (e.g. the cascade
+    path calls shape_slat twice).  We append `_call{N}` so fixtures from
+    multiple invocations don't overwrite each other.
+    """
+    import functools
+
+    stage_map = {
+        "sample_sparse_structure":      "02_sparse_structure",
+        "sample_shape_slat":            "03a_shape_slat",
+        "sample_shape_slat_cascade":    "03b_shape_slat_cascade",
+        "decode_shape_slat":            "04_shape_slat_decoded",
+        "sample_tex_slat":              "05_tex_slat",
+        "decode_tex_slat":              "06_tex_slat_decoded",
+    }
+
+    call_counter: dict[str, int] = {n: 0 for n in stage_map.values()}
+
+    for method_name, fixture_name in stage_map.items():
+        original = getattr(pipeline, method_name, None)
+        if original is None or not callable(original):
+            continue
+
+        def make_wrapper(orig, fname):
+            @functools.wraps(orig)
+            def wrapped(*args, **kwargs):
+                result = orig(*args, **kwargs)
+                idx = call_counter[fname]
+                call_counter[fname] += 1
+                tag = fname if idx == 0 else f"{fname}_call{idx}"
+                _dump_fixture(tag, result, fixture_dir=fixture_dir)
+                return result
+            return wrapped
+
+        setattr(pipeline, method_name, make_wrapper(original, fixture_name))
+    print(f"[fixture] pipeline stage hooks installed -> {fixture_dir}",
+          flush=True)
+
+
+def _dump_run_metadata(fixture_dir: str, *, image_path: str, args_dict: dict,
+                       seed: int) -> None:
+    """Write 00_metadata.json with everything needed to reproduce the run."""
+    import json
+    import hashlib
+    import platform
+
+    os.makedirs(fixture_dir, exist_ok=True)
+
+    try:
+        with open(image_path, "rb") as f:
+            image_sha256 = hashlib.sha256(f.read()).hexdigest()
+        image_size = os.path.getsize(image_path)
+    except OSError:
+        image_sha256 = None
+        image_size = None
+
+    # Device detection — capture which backend this run will use so we know
+    # which side of the CUDA-vs-MPS diff we're looking at.
+    if torch.cuda.is_available():
+        device_kind = "cuda"
+        device_name = torch.cuda.get_device_name(0)
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device_kind = "mps"
+        device_name = "Apple Silicon"
+    else:
+        device_kind = "cpu"
+        device_name = platform.processor() or "cpu"
+
+    meta = {
+        "image_path": os.path.abspath(image_path),
+        "image_sha256": image_sha256,
+        "image_size_bytes": image_size,
+        "seed": seed,
+        "args": args_dict,
+        "torch_version": torch.__version__,
+        "device_kind": device_kind,
+        "device_name": device_name,
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "env": {k: os.environ.get(k) for k in [
+            "ATTN_BACKEND", "SPARSE_CONV_BACKEND", "SPARSE_ATTN_BACKEND",
+            "PYTORCH_CUDA_ALLOC_CONF", "PIXAL3D_DUMP_FIXTURES",
+        ] if os.environ.get(k) is not None},
+    }
+    out = os.path.join(fixture_dir, "00_metadata.json")
+    with open(out, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[fixture] metadata -> {out}", flush=True)
+
+
 IMAGE_COND_CONFIGS = {
     "ss": {
         "model_name": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
@@ -186,11 +346,45 @@ def run_inference(
     # Load models
     pipeline = init_pipeline(model_path, low_vram=low_vram)
 
+    # Fixture-capture instrumentation (CUDA-vs-MPS divergence analysis).
+    # Enabled only when PIXAL3D_DUMP_FIXTURES is set in the environment.
+    if PIXAL3D_DUMP_FIXTURES:
+        _dump_run_metadata(
+            PIXAL3D_DUMP_FIXTURES,
+            image_path=image_path,
+            args_dict={
+                "output_path": output_path, "seed": seed,
+                "ss_guidance_strength": ss_guidance_strength,
+                "ss_guidance_rescale": ss_guidance_rescale,
+                "ss_sampling_steps": ss_sampling_steps,
+                "ss_rescale_t": ss_rescale_t,
+                "shape_slat_guidance_strength": shape_slat_guidance_strength,
+                "shape_slat_guidance_rescale": shape_slat_guidance_rescale,
+                "shape_slat_sampling_steps": shape_slat_sampling_steps,
+                "shape_slat_rescale_t": shape_slat_rescale_t,
+                "tex_slat_guidance_strength": tex_slat_guidance_strength,
+                "tex_slat_guidance_rescale": tex_slat_guidance_rescale,
+                "tex_slat_sampling_steps": tex_slat_sampling_steps,
+                "tex_slat_rescale_t": tex_slat_rescale_t,
+                "mesh_scale": mesh_scale, "extend_pixel": extend_pixel,
+                "image_resolution": image_resolution,
+                "max_num_tokens": max_num_tokens, "model_path": model_path,
+                "manual_fov": manual_fov, "low_vram": low_vram,
+                "resolution": resolution,
+            },
+            seed=seed,
+        )
+        _install_pipeline_fixture_hooks(pipeline, PIXAL3D_DUMP_FIXTURES)
+
     # Preprocess image first — rembg loads to GPU for this call, then offloads.
     # MoGe is loaded afterwards so both never occupy VRAM at the same time.
     print(f"[Inference] Processing image: {image_path}")
     img = Image.open(image_path)
     image_preprocessed = pipeline.preprocess_image(img)
+    _dump_fixture("00_preprocessed_image",
+                  {"mode": image_preprocessed.mode,
+                   "size": image_preprocessed.size,
+                   "pixels": np.array(image_preprocessed)})
 
     # Save preprocessed image for MoGe
     tmp_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), f"_tmp_preprocessed_{int(time.time()*1000)}.png")
@@ -223,6 +417,7 @@ def run_inference(
         del moge_model
         torch.cuda.empty_cache()
     os.remove(tmp_path)
+    _dump_fixture("01_camera_params", camera_params)
 
     # Run pipeline
     print("[Inference] Running 3D generation pipeline...")
@@ -257,6 +452,12 @@ def run_inference(
     )
 
     mesh = mesh_list[0]
+    _dump_fixture("07_run_output", {
+        "mesh": mesh,
+        "shape_slat": shape_slat,
+        "tex_slat": tex_slat,
+        "res": res,
+    })
 
     # Extract GLB
     print("[Inference] Extracting GLB...")
@@ -267,6 +468,10 @@ def run_inference(
         decimation_target=1000000, texture_size=4096,
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
     )
+    # Capture to_glb output BEFORE the rotation step so the fixture matches
+    # what came out of the upstream postprocess pipeline.  Geometry-only:
+    # textures are dumped separately if we ever need them.
+    _dump_fixture("08_to_glb_geometry", glb)
 
     # Apply rotation
     rot = np.array([
