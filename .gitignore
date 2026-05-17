@@ -16,6 +16,9 @@ checkpoints/
 xatlas.txt
 *_basecolor*.png
 
+# Phase-6-style experiment dumps (large .glb / log artefacts)
+scratch/
+
 # OMC / session state
 .omc/
 .claude/

@@ -596,17 +596,19 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         for m, v in zip(meshes, tex_voxels):
             if torch.cuda.is_available() and m.device.type == 'cuda':
                 m.fill_holes()
-            out_mesh.append(
-                MeshWithVoxel(
-                    m.vertices, m.faces,
-                    origin = [-0.5, -0.5, -0.5],
-                    voxel_size = 1 / resolution,
-                    coords = v.coords[:, 1:],
-                    attrs = v.feats,
-                    voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
-                    layout=self.pbr_attr_layout
-                )
+            mesh_with_voxel = MeshWithVoxel(
+                m.vertices, m.faces,
+                origin = [-0.5, -0.5, -0.5],
+                voxel_size = 1 / resolution,
+                coords = v.coords[:, 1:],
+                attrs = v.feats,
+                voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
+                layout=self.pbr_attr_layout
             )
+            for attr in ("fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight"):
+                if hasattr(m, attr):
+                    setattr(mesh_with_voxel, attr, getattr(m, attr))
+            out_mesh.append(mesh_with_voxel)
         return out_mesh
     
     @torch.no_grad()

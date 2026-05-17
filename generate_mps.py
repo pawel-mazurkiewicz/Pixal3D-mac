@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -14,6 +16,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_NATIVE_O_VOXEL_PYTHON = (
+    ROOT.parent / "trellis-mac" / ".venv" / "bin" / "python"
+)
 
 
 def _configure_mps_environment():
@@ -447,52 +452,159 @@ def export_geometry_only(vertices: np.ndarray, faces: np.ndarray, glb_path: Path
     print(f"[Export] Geometry-only GLB saved to {glb_path}")
 
 
-def try_export_metal_glb(mesh, pipeline, resolution: int, vertices: np.ndarray, faces: np.ndarray, glb_path: Path, args) -> bool:
+def _write_mesh_npz(path: Path, mesh, vertices: np.ndarray, faces: np.ndarray, resolution: int):
+    payload = dict(
+        vertices=vertices.astype(np.float32),
+        faces=faces.astype(np.int32),
+        coords=mesh.coords.detach().cpu().numpy(),
+        attrs=mesh.attrs.detach().cpu().numpy(),
+        origin=mesh.origin.detach().cpu().numpy().astype(np.float32),
+        voxel_size=np.float32(float(mesh.voxel_size)),
+        resolution=np.int32(int(resolution)),
+    )
+    for attr in ("fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight"):
+        value = getattr(mesh, attr, None)
+        if value is not None:
+            payload[attr] = value.detach().cpu().numpy()
+    np.savez(str(path), **payload)
+
+
+def _native_o_voxel_python_candidates(args):
+    seen = set()
+    for candidate in (
+        args.o_voxel_python,
+        os.environ.get("O_VOXEL_PYTHON"),
+        DEFAULT_NATIVE_O_VOXEL_PYTHON,
+        shutil.which("python3.11"),
+    ):
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield path
+
+
+def _resolve_native_o_voxel_python(args) -> Path | None:
+    for path in _native_o_voxel_python_candidates(args):
+        if path.exists():
+            return path
+    return None
+
+
+def _native_o_voxel_env(glb_path: Path) -> dict:
+    env = os.environ.copy()
+    env.setdefault("FLEX_GEMM_AUTOTUNE_CACHE_PATH", str(ROOT / "autotune_cache.json"))
+    env.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "0")
+    env.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    # Keep the native exporter's transient caches in a writable project path.
+    env.setdefault("TMPDIR", str(glb_path.parent.resolve()))
+    return env
+
+
+def _configure_fdg_environment(args):
+    os.environ["PIXAL3D_FDG_CAP_PARTIAL_QUADS"] = "1" if args.fdg_cap_partial_quads else "0"
+    os.environ["PIXAL3D_FDG_VERBOSE"] = "1" if args.fdg_verbose else "0"
+
+
+def _prefill_holes_for_native(vertices: np.ndarray, faces: np.ndarray, args) -> tuple[np.ndarray, np.ndarray]:
+    perimeter = float(args.native_prefill_holes_perimeter)
+    if perimeter <= 0:
+        return vertices, faces
+    try:
+        from pixal3d.utils.cumesh_port.fill_holes import fill_holes
+    except Exception as exc:
+        print(f"[Export] Native pre-fill requested but cumesh_port.fill_holes is unavailable: {exc}")
+        return vertices, faces
+
+    print(f"[Export] Pre-filling closed boundary loops before native o_voxel (perimeter < {perimeter:g})...")
+    return fill_holes(
+        vertices.astype(np.float32, copy=False),
+        faces.astype(np.int32, copy=False),
+        max_hole_perimeter=perimeter,
+        verbose=args.native_o_voxel_verbose,
+    )
+
+
+def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, faces: np.ndarray, glb_path: Path, args) -> bool:
     if args.no_texture or args.force_texture_fallback:
         return False
 
-    try:
-        import o_voxel.postprocess as postprocess
-    except (ImportError, RuntimeError, OSError, AttributeError) as exc:
-        print(f"[Export] o_voxel.postprocess unavailable: {exc}")
+    native_python = _resolve_native_o_voxel_python(args)
+    if native_python is None:
+        print("[Export] Native o_voxel Python not found; using fallback baker.")
         return False
 
-    if not hasattr(postprocess, "to_glb"):
-        print("[Export] o_voxel.postprocess has no to_glb; using fallback baker.")
+    bridge = ROOT / "pixal3d" / "utils" / "o_voxel_native_export.py"
+    if not bridge.exists():
+        print(f"[Export] Native o_voxel bridge missing: {bridge}")
         return False
 
+    native_vertices, native_faces = _prefill_holes_for_native(vertices, faces, args)
+    if args.skip_decimation:
+        # o_voxel.to_glb has two simplify calls.  Passing the input face count
+        # is not enough because fill_holes/cleanup can add faces before the
+        # second call, which then still decimates.  Use a deliberately high
+        # target so simplify() is a no-op while preserving UV/bake/export.
+        target_faces = max(len(native_faces) * 4, int(args.native_decimation_target))
+    else:
+        target_faces = max(1, int(args.native_decimation_target))
+
+    tmp_file = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".npz",
+        prefix="o_voxel_native_",
+        dir=str(glb_path.parent),
+    )
+    native_input = Path(tmp_file.name)
+    tmp_file.close()
+
     try:
-        patch_o_voxel_grid_sample_if_needed(postprocess)
-        target_faces = min(args.bake_face_target, len(faces))
-        bake_vertices, bake_faces = simplify_vertices_faces(vertices, faces, target_faces)
-        vertices_t = torch.from_numpy(bake_vertices).float()
-        faces_t = torch.from_numpy(bake_faces.astype(np.int32)).int()
-        print(f"[Export] Baking PBR textures via o_voxel ({args.texture_size}x{args.texture_size})...")
-        glb = postprocess.to_glb(
-            vertices=vertices_t,
-            faces=faces_t,
-            attr_volume=mesh.attrs.detach().cpu(),
-            coords=mesh.coords.detach().cpu(),
-            attr_layout=getattr(mesh, "layout", pipeline.pbr_attr_layout),
-            grid_size=resolution,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target=target_faces,
-            texture_size=args.texture_size,
-            remesh=True,
-            remesh_band=1,
-            remesh_project=0,
-            use_tqdm=True,
+        _write_mesh_npz(native_input, mesh, native_vertices, native_faces, resolution)
+        print(
+            f"[Export] Baking PBR textures via native o_voxel "
+            f"({args.texture_size}x{args.texture_size}, target={target_faces:,})..."
         )
-        glb.apply_transform(EXPORT_ROTATION)
-        try:
-            glb.export(str(glb_path), extension_webp=True)
-        except TypeError:
-            glb.export(str(glb_path))
+        cmd = [
+            str(native_python),
+            str(bridge),
+            "--input", str(native_input),
+            "--output", str(glb_path),
+            "--texture-size", str(args.texture_size),
+            "--decimation-target", str(target_faces),
+            "--remesh-band", str(args.native_remesh_band),
+            "--remesh-project", str(args.native_remesh_project),
+            "--mesh-cluster-threshold", str(args.native_mesh_cluster_threshold),
+            "--mesh-cluster-refine-iterations", str(args.native_mesh_cluster_refine_iterations),
+            "--mesh-cluster-global-iterations", str(args.native_mesh_cluster_global_iterations),
+            "--mesh-cluster-smooth-strength", str(args.native_mesh_cluster_smooth_strength),
+            "--output-transform", args.native_output_transform,
+        ]
+        if args.native_remesh:
+            cmd.append("--remesh")
+        if args.native_o_voxel_verbose:
+            cmd.append("--verbose")
+
+        result = subprocess.run(cmd, env=_native_o_voxel_env(glb_path), check=False)
+        if result.returncode != 0:
+            print(f"[Export] Native o_voxel export failed with exit code {result.returncode}; using fallback baker.")
+            return False
+        if not glb_path.exists() or glb_path.stat().st_size == 0:
+            print("[Export] Native o_voxel finished but did not write a non-empty GLB; using fallback baker.")
+            return False
         print(f"[Export] Textured GLB saved to {glb_path}")
         return True
     except Exception as exc:
-        print(f"[Export] o_voxel texture bake failed: {exc}")
+        print(f"[Export] Native o_voxel texture bake failed: {exc}")
         return False
+    finally:
+        if os.environ.get("PIXAL3D_KEEP_NATIVE_O_VOXEL_INPUT") != "1":
+            try:
+                native_input.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def export_fallback_texture_glb(mesh, vertices: np.ndarray, faces: np.ndarray, glb_path: Path, args):
@@ -616,6 +728,38 @@ def parse_args():
     parser.add_argument("--max-num-tokens", type=int, default=49152)
     parser.add_argument("--texture-size", type=int, default=2048, choices=[512, 1024, 2048, 4096])
     parser.add_argument(
+        "--fdg-cap-partial-quads",
+        dest="fdg_cap_partial_quads",
+        action="store_true",
+        default=True,
+        help=(
+            "During MPS flexible-dual-grid mesh extraction, emit a triangle "
+            "when an intersected grid edge has 3 of its 4 neighboring dual "
+            "voxels present.  This closes holes caused by the strict fallback "
+            "extractor dropping the whole quad.  Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-fdg-cap-partial-quads",
+        dest="fdg_cap_partial_quads",
+        action="store_false",
+        help="Disable the partial-quad cap and use the strict original extractor.",
+    )
+    parser.add_argument(
+        "--fdg-verbose",
+        action="store_true",
+        help="Print flexible-dual-grid extraction counts while decoding the mesh.",
+    )
+    parser.add_argument(
+        "--reextract-mesh-from-fdg",
+        action="store_true",
+        help=(
+            "When loading a checkpoint saved with FDG tensors, re-run "
+            "flexible_dual_grid_to_mesh using the current FDG extraction "
+            "settings before export."
+        ),
+    )
+    parser.add_argument(
         "--voxel-remesh-size",
         type=float,
         default=0.0,
@@ -697,6 +841,61 @@ def parse_args():
     parser.add_argument("--no-texture", action="store_true", help="Export geometry-only GLB")
     parser.add_argument("--force-texture-fallback", action="store_true", help="Skip o_voxel.to_glb and use KDTree/xatlas")
     parser.add_argument(
+        "--o-voxel-python",
+        default=None,
+        help=(
+            "Python interpreter that can import the native Metal o_voxel stack. "
+            "Defaults to $O_VOXEL_PYTHON, then ../trellis-mac/.venv/bin/python, "
+            "then python3.11 if present."
+        ),
+    )
+    parser.add_argument(
+        "--native-decimation-target",
+        type=int,
+        default=1000000,
+        help=(
+            "Face target for native o_voxel.postprocess.to_glb.  Defaults to "
+            "1,000,000 to match the Pixal3D/TRELLIS export pipeline.  The "
+            "fallback baker still uses --bake-face-target."
+        ),
+    )
+    parser.add_argument(
+        "--native-remesh",
+        action="store_true",
+        help="Enable o_voxel's narrow-band dual-contouring remesh branch before simplification.",
+    )
+    parser.add_argument("--native-remesh-band", type=float, default=1.0)
+    parser.add_argument("--native-remesh-project", type=float, default=0.0)
+    parser.add_argument(
+        "--native-prefill-holes-perimeter",
+        type=float,
+        default=3e-2,
+        help=(
+            "Run the local cumesh_port.fill_holes implementation on the raw "
+            "mesh before native o_voxel.to_glb.  Defaults to cumesh's 3e-2 "
+            "threshold; set 0 to rely only on native o_voxel's fill_holes."
+        ),
+    )
+    parser.add_argument(
+        "--native-output-transform",
+        choices=["pixal3d", "o_voxel", "y_up"],
+        default="pixal3d",
+        help=(
+            "Post-transform for native o_voxel output.  'pixal3d' fixes the "
+            "sideways native output and matches the earlier MPS export axis "
+            "convention; 'o_voxel' preserves raw native orientation."
+        ),
+    )
+    parser.add_argument("--native-mesh-cluster-threshold", type=float, default=math.radians(90.0))
+    parser.add_argument("--native-mesh-cluster-refine-iterations", type=int, default=0)
+    parser.add_argument("--native-mesh-cluster-global-iterations", type=int, default=1)
+    parser.add_argument("--native-mesh-cluster-smooth-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--native-o-voxel-verbose",
+        action="store_true",
+        help="Print verbose progress from the native o_voxel subprocess.",
+    )
+    parser.add_argument(
         "--uv-unwrap",
         choices=["auto", "blender", "xatlas"],
         default="auto",
@@ -748,7 +947,10 @@ class _LoadedMesh:
     ``attrs``, ``origin``, ``voxel_size``).  Used when resuming from a
     ``--save-mesh`` checkpoint."""
 
-    __slots__ = ("vertices", "faces", "coords", "attrs", "origin", "voxel_size")
+    __slots__ = (
+        "vertices", "faces", "coords", "attrs", "origin", "voxel_size",
+        "fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight",
+    )
 
 
 def save_mesh_checkpoint(path, mesh, vertices, faces, resolution):
@@ -756,16 +958,7 @@ def save_mesh_checkpoint(path, mesh, vertices, faces, resolution):
     without re-running the ~8-10 min sampling pipeline."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        str(out),
-        vertices=vertices.astype(np.float32),
-        faces=faces.astype(np.int32),
-        coords=mesh.coords.detach().cpu().numpy(),
-        attrs=mesh.attrs.detach().cpu().numpy(),
-        origin=mesh.origin.detach().cpu().numpy().astype(np.float32),
-        voxel_size=np.float32(float(mesh.voxel_size)),
-        resolution=np.int32(int(resolution)),
-    )
+    _write_mesh_npz(out, mesh, vertices, faces, resolution)
     size_mb = out.stat().st_size / 1e6
     print(f"[Checkpoint] Saved mesh to {out} ({size_mb:.1f} MB)")
 
@@ -783,12 +976,46 @@ def load_mesh_checkpoint(path):
     mesh.attrs = torch.from_numpy(data["attrs"])
     mesh.origin = torch.from_numpy(data["origin"])
     mesh.voxel_size = float(data["voxel_size"])
+    for attr in ("fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight"):
+        if attr in data.files:
+            setattr(mesh, attr, torch.from_numpy(data[attr]))
+        else:
+            setattr(mesh, attr, None)
     resolution = int(data["resolution"])
     return mesh, vertices, faces, resolution
 
 
+def reextract_mesh_from_fdg(mesh, resolution: int):
+    if any(getattr(mesh, attr, None) is None for attr in (
+        "fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight",
+    )):
+        raise SystemExit(
+            "--reextract-mesh-from-fdg requires a checkpoint saved after FDG "
+            "checkpointing was added. Regenerate once with --save-mesh."
+        )
+    from pixal3d.utils.mesh_extract import flexible_dual_grid_to_mesh
+
+    print("[FDG] Re-extracting mesh from checkpointed flexible-dual-grid tensors...")
+    vertices_t, faces_t = flexible_dual_grid_to_mesh(
+        mesh.fdg_coords,
+        mesh.fdg_dual_vertices,
+        mesh.fdg_intersected,
+        mesh.fdg_split_weight,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        grid_size=resolution,
+        train=False,
+    )
+    mesh.vertices = vertices_t
+    mesh.faces = faces_t.int()
+    vertices = vertices_t.detach().cpu().numpy()
+    faces = faces_t.detach().cpu().numpy().astype(np.int32)
+    print(f"[FDG] Re-extracted {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles")
+    return mesh, vertices, faces
+
+
 def main():
     args = parse_args()
+    _configure_fdg_environment(args)
     glb_path = output_glb_path(args.output)
     glb_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -812,6 +1039,8 @@ def main():
             raise SystemExit(f"Mesh checkpoint not found: {ckpt_path}")
         print(f"[Checkpoint] Loading mesh from {ckpt_path}")
         mesh, vertices, faces, resolution = load_mesh_checkpoint(ckpt_path)
+        if args.reextract_mesh_from_fdg:
+            mesh, vertices, faces = reextract_mesh_from_fdg(mesh, resolution)
         print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles "
               f"(resolution={resolution})")
     else:
@@ -894,12 +1123,7 @@ def main():
     has_voxels = hasattr(mesh, "attrs") and mesh.attrs is not None and hasattr(mesh, "coords") and mesh.coords is not None
     if args.no_texture or not has_voxels:
         export_geometry_only(vertices, faces, glb_path)
-    elif from_checkpoint:
-        # o_voxel.postprocess.to_glb needs the live pipeline + CUDA; when
-        # resuming from a checkpoint we always go through the texture-bake
-        # fallback (the only one that doesn't need o_voxel anyway).
-        export_fallback_texture_glb(mesh, vertices, faces, glb_path, args)
-    elif not try_export_metal_glb(mesh, pipeline, resolution, vertices, faces, glb_path, args):
+    elif not try_export_native_o_voxel_glb(mesh, resolution, vertices, faces, glb_path, args):
         export_fallback_texture_glb(mesh, vertices, faces, glb_path, args)
 
     if not glb_path.exists() or glb_path.stat().st_size == 0:

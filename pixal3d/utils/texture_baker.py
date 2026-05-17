@@ -331,7 +331,10 @@ def bake_texture(
     return base_color_img, mr_img, current_mask
 
 
-def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img=None, output_path="output.glb"):
+def export_glb_with_texture(
+    vertices, faces, uvs, base_color_img, mr_img=None,
+    output_path="output.glb", vertex_normals=None,
+):
     import trimesh
     from PIL import Image
 
@@ -350,7 +353,16 @@ def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img=None, o
     else:
         base_color_pil = Image.fromarray(base_color_img)
 
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # Pass vertex_normals if provided — without them, GLB viewers fall back
+    # to flat per-face shading and the surface looks heavily faceted even
+    # when the underlying mesh has smooth-ish triangulation.  Trimesh
+    # auto-recomputes normals if we leave it None AND process=True, but
+    # we keep process=False to avoid mutating our hand-crafted topology.
+    mesh = trimesh.Trimesh(
+        vertices=vertices, faces=faces,
+        vertex_normals=vertex_normals,
+        process=False,
+    )
     material = trimesh.visual.material.PBRMaterial(
         baseColorTexture=base_color_pil,
         metallicFactor=0.0,
