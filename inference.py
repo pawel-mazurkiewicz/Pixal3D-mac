@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import math
 import time
@@ -77,7 +78,12 @@ def _fixture_to_cpu(x):
 
 
 def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
-    """Save a fixture under <fixture_dir>/<name>.pt.  No-op if disabled."""
+    """Save a fixture under <fixture_dir>/<name>.pt.  No-op if disabled.
+
+    If the env var PIXAL3D_STOP_AFTER is set and matches this fixture name,
+    exits the process cleanly after the save — used to skip late stages
+    (e.g. shape/texture VAE decode) when we only care about the early
+    pipeline."""
     target = fixture_dir if fixture_dir is not None else PIXAL3D_DUMP_FIXTURES
     if not target:
         return
@@ -89,6 +95,11 @@ def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
         print(f"[fixture] {name} -> {out} ({sz / 1e6:.2f} MB)", flush=True)
     except Exception as exc:
         print(f"[fixture] WARN failed to dump {name}: {exc}", flush=True)
+    stop_after = os.environ.get("PIXAL3D_STOP_AFTER", "").strip()
+    if stop_after and name == stop_after:
+        print(f"[fixture] PIXAL3D_STOP_AFTER={stop_after} matched; exiting.",
+              flush=True)
+        sys.exit(0)
 
 
 def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
@@ -129,6 +140,66 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
 
         setattr(pipeline, method_name, make_wrapper(original, fixture_name))
     print(f"[fixture] pipeline stage hooks installed -> {fixture_dir}",
+          flush=True)
+
+    # --- per-step sampler dumps -------------------------------------------
+    # Monkey-patch FlowEulerSampler.sample (the base method that the CFG and
+    # GuidanceInterval subclasses delegate to via super().sample(...)) so we
+    # capture every intermediate pred_x_t / pred_x_0 of the 12 denoising
+    # steps.  Fixture names are derived from tqdm_desc so dumps from
+    # different samplers (sparse-structure, shape SLat, HR shape SLat,
+    # texture SLat) land in distinct files.
+    try:
+        from pixal3d.pipelines.samplers.flow_euler import FlowEulerSampler
+    except Exception as exc:
+        print(f"[fixture] WARN: cannot import FlowEulerSampler ({exc}); "
+              "per-step dumps disabled.", flush=True)
+        return
+
+    if getattr(FlowEulerSampler.sample, "_pixal3d_patched", False):
+        return  # already patched (e.g. hooks installed twice)
+
+    import re
+    _desc_to_tag = [
+        ("hr shape slat",     "03b_shape_slat_cascade"),
+        ("sparse structure",  "02_sparse_structure"),
+        ("shape slat",        "03a_shape_slat"),
+        ("texture slat",      "05_tex_slat"),
+    ]
+    def _tag_from_desc(desc: str) -> str:
+        d = (desc or "").lower()
+        for needle, tag in _desc_to_tag:
+            if needle in d:
+                return tag
+        return "xx_" + re.sub(r"[^a-z0-9]+", "_", d).strip("_") or "xx_unknown"
+
+    sampler_call_counter: dict[str, int] = {}
+    original_sample = FlowEulerSampler.sample
+
+    @functools.wraps(original_sample)
+    def patched_sample(self, *args, **kwargs):
+        desc = kwargs.get("tqdm_desc", "Sampling")
+        result = original_sample(self, *args, **kwargs)
+        tag = _tag_from_desc(desc)
+        idx = sampler_call_counter.get(tag, 0)
+        sampler_call_counter[tag] = idx + 1
+        call_suffix = "" if idx == 0 else f"_call{idx}"
+        try:
+            pred_x_t = list(result.pred_x_t) if hasattr(result, "pred_x_t") else []
+            pred_x_0 = list(result.pred_x_0) if hasattr(result, "pred_x_0") else []
+        except Exception:
+            pred_x_t, pred_x_0 = [], []
+        n = min(len(pred_x_t), len(pred_x_0))
+        for i in range(n):
+            step_name = f"{tag}{call_suffix}_step{i:02d}"
+            _dump_fixture(step_name,
+                          {"pred_x_t": pred_x_t[i], "pred_x_0": pred_x_0[i]},
+                          fixture_dir=fixture_dir)
+        return result
+
+    patched_sample._pixal3d_patched = True
+    FlowEulerSampler.sample = patched_sample
+    print("[fixture] FlowEulerSampler.sample patched for per-step dumps.",
           flush=True)
 
 

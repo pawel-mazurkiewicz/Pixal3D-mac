@@ -75,9 +75,11 @@ mkdir -p "$FIXTURES"
 mkdir -p "$(dirname "$OUTPUT")"
 
 # --- env hygiene: ensure CUDA defaults, not the Mac sdpa workaround ---
-# These are the upstream defaults; clear any inherited overrides so we
-# capture the reference path.
+# Clear any inherited overrides then set the reference defaults explicitly.
 unset ATTN_BACKEND SPARSE_ATTN_BACKEND SPARSE_CONV_BACKEND 2>/dev/null || true
+# NATTEN pre-built wheels often omit sm_86 (A4000/3090) and other arches;
+# sdpa is numerics-equivalent for our purposes and works on any GPU.
+export SPARSE_ATTN_BACKEND=sdpa
 
 export PIXAL3D_DUMP_FIXTURES="$FIXTURES"
 

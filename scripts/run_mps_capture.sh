@@ -121,8 +121,8 @@ set +e
     --output "$OUTPUT" \
     --seed "$SEED" \
     --resolution "$RESOLUTION" \
-    "${LOW_VRAM_FLAG[@]}" \
-    "${EXTRA_ARGS[@]}" \
+    ${LOW_VRAM_FLAG[@]+"${LOW_VRAM_FLAG[@]}"} \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
     2>&1 | tee "$LOG"
 RC=${PIPESTATUS[0]}
 set -e

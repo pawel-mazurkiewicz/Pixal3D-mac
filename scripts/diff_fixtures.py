@@ -31,6 +31,56 @@ from typing import Any
 
 import torch
 
+try:
+    import numpy as np  # optional — only needed when fixtures contain ndarrays
+    _HAVE_NUMPY = True
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore
+    _HAVE_NUMPY = False
+
+
+# --- CUDA-only module stubs ----------------------------------------------
+# CUDA-side fixtures sometimes pickle objects whose class lives in modules
+# that don't exist on the Mac (e.g. flex_gemm, the CUDA-only sparse-conv
+# kernel package).  We register permissive stub classes so unpickling
+# succeeds; the resulting placeholder objects compare structurally via
+# their __dict__ in the walker below.
+
+class _PickleStub:
+    """Permissive stub: accepts any state from pickle's __setstate__ /
+    attribute restoration path, and round-trips via __reduce__."""
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        else:
+            self.__dict__["_state"] = state
+    def __reduce__(self):
+        return (self.__class__, ())
+
+
+def _register_stub_modules() -> None:
+    """Inject stub modules so torch.load can deserialize CUDA-only classes."""
+    import types
+    # Stub flex_gemm.ops.spconv.submanifold_conv3d.SubMConv3dNeighborCache
+    # (the only currently-known offender; extend the list below if more
+    # turn up).
+    needed = [
+        ("flex_gemm.ops.spconv.submanifold_conv3d", "SubMConv3dNeighborCache"),
+    ]
+    for modpath, clsname in needed:
+        # Ensure each parent package exists in sys.modules with a module obj.
+        parts = modpath.split(".")
+        for i in range(1, len(parts) + 1):
+            sub = ".".join(parts[:i])
+            if sub not in sys.modules:
+                sys.modules[sub] = types.ModuleType(sub)
+        # Define the stub class on the leaf module.
+        stub_cls = type(clsname, (_PickleStub,), {"__module__": modpath})
+        setattr(sys.modules[modpath], clsname, stub_cls)
+
+
+_register_stub_modules()
+
 
 # --- ANSI colours ---------------------------------------------------------
 
@@ -106,13 +156,24 @@ def _is_tensor_like(x: Any) -> bool:
 
 
 def _is_scalar_equal(a: Any, b: Any) -> bool:
-    """Loose equality for non-tensor leaf values (ints, strs, bools, etc.)."""
+    """Loose equality for non-tensor leaf values (ints, strs, bools, etc.).
+    Wrapped in bool(...) so anything that returns an array-of-bools (numpy
+    object arrays, pandas, etc.) doesn't blow up the truth check."""
     if type(a) is not type(b):
         return False
     try:
-        return a == b
+        return bool(a == b)
     except Exception:
         return False
+
+
+def _coerce_ndarray(x: Any) -> Any:
+    """Convert numpy arrays to torch tensors so they flow through the numeric
+    diff path.  Object-dtype arrays are left alone (caller handles them as
+    scalars / falls through to type_mismatch)."""
+    if _HAVE_NUMPY and isinstance(x, np.ndarray) and x.dtype != object:
+        return torch.from_numpy(x.copy())
+    return x
 
 
 def walk(a: Any, b: Any, path: str = "") -> list[Diff]:
@@ -127,6 +188,10 @@ def walk(a: Any, b: Any, path: str = "") -> list[Diff]:
     if b is None:
         out.append(Diff(path, "missing", detail="mps side"))
         return out
+
+    # Promote numpy arrays to tensors so the numeric branch handles them.
+    a = _coerce_ndarray(a)
+    b = _coerce_ndarray(b)
 
     if _is_tensor_like(a) and _is_tensor_like(b):
         if a.shape != b.shape:
@@ -168,6 +233,30 @@ def walk(a: Any, b: Any, path: str = "") -> list[Diff]:
         for i in range(n):
             out.extend(walk(a[i], b[i], f"{path}[{i}]"))
         return out
+
+    # Generic object: walk __dict__ when both sides are the same custom
+    # class (or both are stubs of the same name).  Lets SparseTensor,
+    # Mesh, MeshWithVoxel, etc. be diffed without explicit per-class
+    # support — we just compare each attribute recursively.
+    if hasattr(a, "__dict__") and hasattr(b, "__dict__") \
+            and type(a).__name__ == type(b).__name__:
+        ad, bd = a.__dict__, b.__dict__
+        for k in sorted(set(ad) | set(bd)):
+            out.extend(walk(ad.get(k), bd.get(k),
+                            f"{path}.{k}" if path else f".{k}"))
+        return out
+
+    # Numeric scalar diff: floats/ints (and bools treated as 0/1).
+    # Without this branch unequal floats would be reported as type_mismatch
+    # and auto-RED'd regardless of how small the difference is.
+    if isinstance(a, (int, float, bool)) and isinstance(b, (int, float, bool)) \
+            and not isinstance(a, str) and not isinstance(b, str):
+        try:
+            diff = abs(float(a) - float(b))
+            out.append(Diff(path, "numeric", max_abs=diff, mean_abs=diff))
+            return out
+        except (TypeError, ValueError):
+            pass
 
     # Scalar / leaf: exact equality check, no severity.
     if _is_scalar_equal(a, b):
@@ -232,8 +321,10 @@ def compare_fixture(cuda_path: str, mps_path: str) -> FixtureResult:
         res.diffs.append(Diff(name, "missing", detail="mps side"))
         return res
     try:
-        a = torch.load(cuda_path, weights_only=False)
-        b = torch.load(mps_path,  weights_only=False)
+        # map_location='cpu' lets us load CUDA-side fixtures on a CPU-only
+        # machine; harmless on already-CPU tensors.
+        a = torch.load(cuda_path, weights_only=False, map_location="cpu")
+        b = torch.load(mps_path,  weights_only=False, map_location="cpu")
     except Exception as e:
         res.error = f"load failed: {e}"
         return res
