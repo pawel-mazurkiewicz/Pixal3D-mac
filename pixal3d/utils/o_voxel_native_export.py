@@ -339,41 +339,186 @@ def _patch_repair_non_manifold_edges(postprocess_module) -> None:
 
 
 def _patch_remove_small_connected_components(postprocess_module) -> None:
-    """No-op ``remove_small_connected_components`` so cleanup_1 stops culling real surface.
+    """Tunable replacement for ``_MeshBackend.remove_small_connected_components``.
 
-    Empirical (skip-decimation probe):
-    cleanup_1 drops 1.02M faces (8.45M → 7.44M, -12%) even with both
-    simplify calls disabled.  The mechanism is
-    ``repair_non_manifold_edges`` over-splitting ~2.5M vertices on the raw
-    FDG mesh, which fragments real surface into tiny CCs that
-    ``remove_small_connected_components(1e-5)`` then culls as dust.
-    ``fill_holes(3e-2)`` recovers only ~370k of the dropped faces (it only
-    fills loops with perimeter < 3e-2), leaving ~1M faces of real surface
-    permanently gone.
+    Behaviour depends on ``PIXAL3D_SMALL_CC``:
 
-    The visible result: wireframe-and-solid both show holes in cleanup_1's
-    aftermath, regardless of whether simplify ran.
+      unset    -> patch is a no-op; the native Metal small_cc runs at its
+                  upstream default ``min_area=1e-5``.  This is the legacy
+                  behaviour (commented out by default in main).
+      "noop"   -> swap small_cc for a print-only stub.  Per the plan's
+                  variant v4 audit this leaves visible debris+spikes; keep
+                  for diagnostic runs only.
+      <float>  -> use the CPU port (``cumesh_port.cleanup.
+                  remove_small_connected_components``) with the given
+                  min_area override.  Lets us soften culling without
+                  disabling it.  Example: ``PIXAL3D_SMALL_CC=1e-7`` keeps
+                  fragments down to 0.1 mm² (noise floor) while still
+                  removing literal dust.
 
-    Since the upstream threshold ``1e-5`` is calibrated for CUDA cumesh's
-    repair output (which doesn't over-split this badly), and we can't fix
-    repair_nme without rewriting Metal kernels, the most direct counter is
-    to no-op ``remove_small_connected_components`` entirely.  Any literally
-    degenerate triangles are removed by ``remove_degenerate_faces`` /
-    ``remove_duplicate_faces`` anyway, so this only keeps the legitimate
-    surface chunks repair_nme accidentally fragmented.
+    The plan's diagnosis (PAMO_PORT_PLAN.md, Phase 6 log) says the
+    upstream 1e-5 threshold was calibrated for CUDA cumesh's repair output
+    (which doesn't over-split this badly).  Our CPU repair port mirrors
+    CUDA but pamo's collapses still introduce fresh NMEs that repair_nme
+    then splits, so the mesh ends up fragmented; small_cc(1e-5) culls
+    those fragments as dust, fill_holes(3e-2) recovers only the pinprick
+    subset, and ~1M faces of real surface end up permanently gone.
+
+    Tuning this threshold (or replacing small_cc with a perimeter-based
+    criterion) is the most direct way to reduce that loss without
+    introducing the v4 debris/spikes problem.
     """
     MeshBackend = getattr(postprocess_module, "_MeshBackend", None)
     if MeshBackend is None or getattr(MeshBackend, "_remove_small_cc_patched", False):
         return
-    def _noop_remove_small_cc(self, min_area: float):
+
+    env_setting = os.environ.get("PIXAL3D_SMALL_CC", "").strip().lower()
+    if not env_setting:
+        return  # opt-in only; default keeps Metal native small_cc behaviour
+
+    if env_setting == "noop":
+        def _noop_remove_small_cc(self, min_area: float):
+            print(
+                f"[o_voxel-native] skipping remove_small_connected_components"
+                f"(min_area={min_area:.1e}) "
+                f"[V={self.num_vertices:,} F={self.num_faces:,}]",
+                flush=True,
+            )
+        MeshBackend.remove_small_connected_components = _noop_remove_small_cc
+        MeshBackend._remove_small_cc_patched = True
+        print("[o_voxel-native] _MeshBackend.remove_small_connected_components "
+              "patched (PIXAL3D_SMALL_CC=noop)", flush=True)
+        return
+
+    # Numeric override -> CPU port with custom min_area.
+    try:
+        custom_min_area = float(env_setting)
+    except ValueError:
+        print(f"[o_voxel-native] PIXAL3D_SMALL_CC={env_setting!r} "
+              "is neither 'noop' nor a float; ignoring.", flush=True)
+        return
+
+    try:
+        cleanup_mod = _load_cumesh_port_module("cleanup.py")
+    except Exception as exc:
+        print(f"[o_voxel-native] cumesh_port.cleanup unavailable ({exc}); "
+              "falling back to native small_cc.", flush=True)
+        return
+
+    cpu_small_cc = cleanup_mod.remove_small_connected_components
+
+    def _patched_small_cc(self, min_area: float):
+        import torch
+
+        verts_t, faces_t = self.read()
+        verts_np = verts_t.detach().cpu().numpy()
+        faces_np = faces_t.detach().cpu().numpy().astype(np.int64)
+        before_v = verts_np.shape[0]
+        before_f = faces_np.shape[0]
+        new_verts_np, new_faces_np = cpu_small_cc(
+            verts_np, faces_np, min_area=custom_min_area, verbose=False,
+        )
+        after_v = new_verts_np.shape[0]
+        after_f = new_faces_np.shape[0]
         print(
-            f"[o_voxel-native] skipping remove_small_connected_components"
-            f"(min_area={min_area:.1e}) "
-            f"[V={self.num_vertices:,} F={self.num_faces:,}]",
+            f"[o_voxel-native] cpu remove_small_cc(min_area={custom_min_area:.1e}, "
+            f"caller_arg={min_area:.1e} OVERRIDDEN): "
+            f"V {before_v:,} -> {after_v:,} ({after_v - before_v:+,}), "
+            f"F {before_f:,} -> {after_f:,} ({after_f - before_f:+,})",
             flush=True,
         )
-    MeshBackend.remove_small_connected_components = _noop_remove_small_cc
+        verts_out = torch.from_numpy(
+            new_verts_np.astype(verts_t.detach().cpu().numpy().dtype)
+        ).to(verts_t.device)
+        faces_dtype = faces_t.detach().cpu().numpy().dtype
+        faces_out = torch.from_numpy(new_faces_np.astype(faces_dtype)).to(faces_t.device)
+        self.init(verts_out, faces_out)
+
+    MeshBackend.remove_small_connected_components = _patched_small_cc
     MeshBackend._remove_small_cc_patched = True
+    print(f"[o_voxel-native] _MeshBackend.remove_small_connected_components "
+          f"patched (PIXAL3D_SMALL_CC={custom_min_area:.1e})", flush=True)
+
+
+
+def _patch_fill_holes(postprocess_module) -> None:
+    """Replace the Metal ``fill_holes`` with the CPU port, tunable via env.
+
+    The Metal/native ``fill_holes`` runs with cumesh's default
+    ``max_hole_perimeter=3e-2`` (3cm on Pixal3D's unit-cube scale).  That
+    only fills pinprick holes — the FDG-iso-surface noise it was designed
+    for.  Empirical Blender audit of CUDA→Mac-post-pipeline output: ~50k
+    boundary loops in the 5-30cm perimeter range survive, contributing the
+    visible localized damage (broken lantern hood, shattered decorative
+    elements) the user reported.
+
+    Setting ``PIXAL3D_FILL_HOLES_PERIMETER`` to a larger value (e.g. 0.1
+    for 10cm or 0.3 for 30cm) lets us close more of those medium holes.
+    The risk: filling legitimate features like small window openings.
+
+    The CPU port (``cumesh_port.fill_holes``) is the same algorithm as
+    cumesh (centroid fan over CLOSED LOOP boundary components, perimeter <
+    threshold), so the perimeter semantics match exactly.
+    """
+    MeshBackend = getattr(postprocess_module, "_MeshBackend", None)
+    if MeshBackend is None or getattr(MeshBackend, "_fill_holes_patched", False):
+        return
+
+    env_perim = os.environ.get("PIXAL3D_FILL_HOLES_PERIMETER", "").strip()
+    if not env_perim:
+        return  # opt-in only; absent env var keeps Metal default
+    try:
+        max_perim = float(env_perim)
+    except ValueError:
+        print(f"[o_voxel-native] PIXAL3D_FILL_HOLES_PERIMETER={env_perim!r} "
+              "is not a float; ignoring.", flush=True)
+        return
+
+    try:
+        fh_mod = _load_cumesh_port_module("fill_holes.py")
+    except Exception as exc:
+        print(f"[o_voxel-native] cumesh_port.fill_holes unavailable ({exc}); "
+              "falling back to native fill_holes.", flush=True)
+        return
+
+    cpu_fill_holes = fh_mod.fill_holes
+
+    def _patched_fill_holes(self, max_hole_perimeter: float = 3e-2):
+        import torch
+
+        # Honor the env override; ignore the caller-supplied value.
+        perim = max_perim
+        verts_t, faces_t = self.read()
+        verts_np = verts_t.detach().cpu().numpy()
+        faces_np = faces_t.detach().cpu().numpy().astype(np.int64)
+
+        before_v = verts_np.shape[0]
+        before_f = faces_np.shape[0]
+        new_verts_np, new_faces_np = cpu_fill_holes(
+            verts_np, faces_np,
+            max_hole_perimeter=perim,
+            verbose=False,
+        )
+        after_v = new_verts_np.shape[0]
+        after_f = new_faces_np.shape[0]
+        print(
+            f"[o_voxel-native] cpu fill_holes(perim<{perim}): "
+            f"V {before_v:,} -> {after_v:,} (+{after_v - before_v:,}), "
+            f"F {before_f:,} -> {after_f:,} (+{after_f - before_f:,})",
+            flush=True,
+        )
+
+        verts_out = torch.from_numpy(
+            new_verts_np.astype(verts_t.detach().cpu().numpy().dtype)
+        ).to(verts_t.device)
+        faces_dtype = faces_t.detach().cpu().numpy().dtype
+        faces_out = torch.from_numpy(new_faces_np.astype(faces_dtype)).to(faces_t.device)
+        self.init(verts_out, faces_out)
+
+    MeshBackend.fill_holes = _patched_fill_holes
+    MeshBackend._fill_holes_patched = True
+    print(f"[o_voxel-native] _MeshBackend.fill_holes patched "
+          f"(PIXAL3D_FILL_HOLES_PERIMETER={max_perim})", flush=True)
 
 
 
@@ -604,8 +749,9 @@ def main() -> int:
     from o_voxel import postprocess
     _patch_grid_sample_output(postprocess)
     _patch_repair_non_manifold_edges(postprocess)
-    # _patch_remove_small_connected_components(postprocess)  # band-aid disabled
+    _patch_remove_small_connected_components(postprocess)  # opt-in via PIXAL3D_SMALL_CC
     _patch_simplify(postprocess)
+    _patch_fill_holes(postprocess)  # opt-in via PIXAL3D_FILL_HOLES_PERIMETER
 
     vertices, faces, attrs, coords, aabb, resolution = _load_npz(Path(args.input))
     if args.verbose:

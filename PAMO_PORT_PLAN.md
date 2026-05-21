@@ -268,26 +268,152 @@ cleanup chain (``repair_non_manifold_edges`` over-splitting +
    the underlying issue is upstream of simplify, in the FDG cap mesh
    extraction and/or the repair_nme + small_cc downstream interaction.
 
-#### Recommended next steps (next session)
+#### Session 2026-05-20/21 — divergence hunt + downstream investigation
 
-The user's plan: commit current work as WIP, then restart fresh with a
-step-by-step rebuild + quality gate at each stage, using a rented NVIDIA
-box to do CUDA-vs-MPS divergence analysis with the same seed + input
-image.  Concretely:
+The CUDA-vs-MPS snapshot recommended below was completed in this
+session.  See `DIVERGENCE_FINDINGS.md` for the full per-stage diff
+analysis.  The headline: the upstream DiT numerics ARE non-bit-identical
+(pred_x_0 max-abs Δ ~0.3 from sampler step 0, regardless of MoGe / SDPA
+backend / fp32-vs-bf16), but the dominant cause of visible damage in
+final GLBs is the **Mac post-pipeline** itself.  Proof: feeding the
+CUDA-extracted stage-07 mesh (4.48M verts) through the Mac post-pipeline
+produces a GLB with holes in arched openings, broken decorative
+elements, and confetti-style fragments — even though the input mesh was
+CUDA-clean.
 
-1. **Snapshot the divergence point.**  Same image + same seed on CUDA
-   reference and on this Mac pipeline.  Save intermediate tensors after
-   each stage (Sparse-struct sampler, FDG cap, mesh extract, simplify,
-   repair_nme, fill_holes, mesh cluster, UV unwrap, bake).  Diff each.
-   The plan: pamo should produce identical (or near-identical) output to
-   CUDA cumesh on the same input; if not, the bug is in our port.  If
-   yes, the bug is upstream of simplify.
+Direct quantitative comparison (Blender bmesh audit, world-scale ~1m):
+
+| Mesh | Verts | Tris | Boundary edges | Hole loops | >15cm loops |
+|---|---|---|---|---|---|
+| CUDA reference (full pipeline) | 850K | 981K | 626K | 51,709 | 1,880 |
+| Mac full pipeline (MoGe-off) | 960K | 974K | 766K | 95,541 | 1,294 |
+| CUDA mesh → Mac post-pipeline | 924K | 904K | 747K | 101,563 |   947 |
+
+The Mac post-pipeline fragments the input into more hole loops but
+*fewer* huge ones.  The visible damage the user reported (e.g. broken
+lantern hood) is concentrated in feature-rich regions where small holes
+cluster, not from individual gigantic holes.
+
+#### Damage attribution (this session)
+
+The damage chain in the to_glb internal pipeline:
+
+1. pamo's edge collapses introduce new NMEs at the boundary between
+   collapsed and non-collapsed regions (fundamental QEM behaviour, not a
+   bug — every QEM simplifier including CUDA cumesh does this).
+2. ``repair_non_manifold_edges`` splits NME vertices into manifold fans
+   → on the FDG mesh this inflates V from 1.03M → 3.53M (+2.5M).
+3. ``remove_small_connected_components(min_area=1e-5)`` culls fragments;
+   between repair output (3.53M V) and pamo pass 2 input (1.34M V), 2.19M
+   vertices are dropped as "dust".  Many of those are real surface.
+4. ``fill_holes(max_hole_perimeter=3e-2)`` recovers only pinprick loops
+   (< 3cm perimeter, and only closed loops); most of the dropped
+   surface is open boundaries and stays gone.
+
+#### New tunable patches (this session)
+
+Two opt-in environment variables added to
+``pixal3d/utils/o_voxel_native_export.py`` to let us probe the
+downstream chain without rebuilding the Metal binary:
+
+* ``PIXAL3D_FILL_HOLES_PERIMETER=<float>`` — replaces the native
+  ``_MeshBackend.fill_holes`` with the CPU port from
+  ``cumesh_port.fill_holes``, using the given perimeter threshold
+  (default Metal value is 3e-2).  Example: ``=0.1`` to fill loops up to
+  10cm perimeter.  Caveat: only fills CLOSED LOOPS, so much of the
+  observable boundary damage (open chains) is not addressable here.
+* ``PIXAL3D_SMALL_CC=noop`` — replaces ``_MeshBackend.
+  remove_small_connected_components`` with a print-only stub (the
+  variant v4 the previous session tried; documented as "worse — debris
+  + spikes").
+* ``PIXAL3D_SMALL_CC=<float>`` — replaces with the CPU port from
+  ``cumesh_port.cleanup.remove_small_connected_components`` using a
+  custom ``min_area`` override.  Example: ``=1e-7`` keeps fragments down
+  to 0.1 mm² instead of the default 10 mm².
+
+These patches are NOOPs by default (env var absent) so existing
+behaviour is preserved.
+
+#### Experiment results — all parameter tunings land in same quality range
+
+Six post-pipeline variants on the CUDA-replay path (same CUDA-extracted
+stage-07 mesh in; different downstream cleanup configs):
+
+| Variant | Configuration | V | F | Loops | Big (>5cm) | Huge (>15cm) | Top perim | Top-10 sum |
+|---|---|---|---|---|---|---|---|---|
+| C (baseline) | native defaults (small_cc=1e-5, fill_holes=3e-2) | 924K | 904K | 102K | 5,649 | 947 | 3.37m | 16.63m |
+| D | PIXAL3D_FILL_HOLES_PERIMETER=0.1 | 1.11M | 987K | 149K | 6,317 | 952 | **2.20m** | 14.26m |
+| E | PIXAL3D_SMALL_CC=1e-7 | 1.32M | 1.07M | 226K | 5,420 | **899** | 2.37m | 16.04m |
+| F | combo (E + D) | 1.28M | 1.03M | 212K | 6,113 | 922 | 2.44m | 16.01m |
+| G | PIXAL3D_SMALL_CC=noop + fh=0.3 | 1.22M | 988K | 200K | 7,437 | 942 | 2.35m | 15.52m |
+| H | --force-texture-fallback (Python-only path; skips pamo) | 3.07M | 3.66M | 152K | 7,231 | 2,243 | (different topo) | (different topo) |
+
+The verdict: **none of the post-pipeline tunings produce a dramatic
+quality improvement**.  All variants land within 2-3× of each other on
+hole metrics.  Visually (Blender clay-shaded closeups, lantern-area
+angle):
+
+* D ≈ C: fill_holes alone barely changes anything because most damage
+  is open boundaries, not closed loops fill_holes can fix.
+* E and F: slightly more fine detail preserved (decorative spires, fine
+  base elements) than C, but more total small-perimeter holes.
+* G: similar to E.  Disabling small_cc + filling larger holes nets out.
+* H: completely different mesh density (3.66M F because pamo never
+  ran), broadly similar visual quality.
+
+#### Recommendation for users with quality concerns
+
+Pick the configuration that best matches the use case:
+
+* **Default config** (no env var) — fewest holes overall but the
+  largest holes are the worst.  Best when texture hides small-hole
+  damage in 95% of the model and a few visible holes near features
+  (lantern hood, etc.) are tolerable.
+* **PIXAL3D_SMALL_CC=1e-7** — preserves more fine detail at the cost of
+  more visible "noise" (debris-like fragments).  Recommended when fine
+  decorative elements matter (lanterns, fine geometric features).
+* **--force-texture-fallback** — bypass to_glb entirely; produces a
+  much denser mesh.  Slower bake.  Use when the native pipeline is
+  failing repeatedly.
+
+#### What this DOESN'T fix
+
+The fundamental cause is upstream of pamo:
+
+* FDG cap mesh has 904K pre-existing non-manifold edges per the plan's
+  Phase 6 diagnosis.
+* QEM-based simplification (pamo OR cumesh) creates additional NMEs
+  at collapse boundaries.
+* No post-cleanup can fully recover what these NMEs cost when run
+  through the repair_nme + small_cc + fill_holes chain.
+
+The next real fix is either:
+1. Pre-process the FDG mesh to repair NMEs BEFORE pamo runs.
+2. Investigate --fdg-cap-partial-quads to see if the FDG decoder can
+   produce a more-manifold mesh in the first place.
+3. Investigate why CUDA upstream cumesh handles this gracefully but
+   the Mac CPU port doesn't (might be a difference in cumesh's
+   repair_nme algorithm vs our cumesh_port.repair).
+
+#### Original recommended next steps (still relevant)
+
+1. **Snapshot the divergence point.**  ✅ Done — see
+   `DIVERGENCE_FINDINGS.md`.  Conclusion: stage 02 (sparse-structure
+   sampler) first diverges by ~0.3 magnitude on pred_x_0; the divergence
+   is pervasive across the DiT forward pass, not localised to one
+   broken kernel.  All single-kernel ablations (MoGe, SDPA backend,
+   fp32-vs-bf16, fused-vs-naive attention) failed to move the needle.
 2. **If the FDG cap output is the divergence point**, investigate the
    ``--fdg-cap-partial-quads`` heuristic and/or the FDG decoder more
-   carefully — that's where the 904k NMEs originate.
+   carefully — that's where the 904k NMEs originate.  Not investigated
+   in this session.
 3. **If the divergence is in cumesh's `repair_non_manifold_edges`**, our
-   `cumesh_port.repair` (CPU port) may need rework — or we should
-   compare against CUDA cumesh's native repair on Linux+CUDA hardware.
+   `cumesh_port.repair` (CPU port) may need rework.  The CPU port
+   mirrors CUDA semantics faithfully (face-corner union-find →
+   manifold-fan split), but on the FDG mesh it still emits +2.5M
+   vertices because the FDG mesh has 904K pre-existing NMEs.  The bug
+   is not in the port; it's that QEM-based simplification on an
+   NME-heavy input mesh creates more NMEs that compound.
 
 #### Files touched in this Phase 6 (WIP commit candidate)
 

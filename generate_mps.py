@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -19,6 +20,198 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_NATIVE_O_VOXEL_PYTHON = (
     ROOT.parent / "trellis-mac" / ".venv" / "bin" / "python"
 )
+
+# ============================================================================
+# Fixture capture — set PIXAL3D_DUMP_FIXTURES=/path to enable.
+# Dumps intermediate tensors at every pipeline stage boundary so the MPS run
+# can be diffed stage-by-stage against a CUDA reference capture.
+# ============================================================================
+PIXAL3D_DUMP_FIXTURES = os.environ.get("PIXAL3D_DUMP_FIXTURES", "").strip()
+
+
+def _fixture_to_cpu(x):
+    """Recursively detach + move tensors to CPU for portable fixture saves."""
+    if torch is not None and torch.is_tensor(x):
+        return x.detach().cpu()
+    if isinstance(x, dict):
+        return {k: _fixture_to_cpu(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_fixture_to_cpu(v) for v in x)
+    if hasattr(x, "vertices") and hasattr(x, "faces"):
+        out = {}
+        for attr in ("vertices", "faces", "attrs", "coords", "uv",
+                     "vertex_normals", "face_normals", "visual"):
+            if hasattr(x, attr):
+                v = getattr(x, attr)
+                if v is not None:
+                    try:
+                        out[attr] = _fixture_to_cpu(v)
+                    except Exception:
+                        pass
+        out["_repr"] = repr(x)[:200]
+        return out
+    return x
+
+
+def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
+    """Save a fixture under <fixture_dir>/<name>.pt.  No-op if disabled.
+
+    If the env var PIXAL3D_STOP_AFTER is set and matches this fixture name,
+    exits the process cleanly after the save — used to skip late stages
+    (e.g. shape/texture VAE decode) when we only care about the early
+    pipeline."""
+    target = fixture_dir if fixture_dir is not None else PIXAL3D_DUMP_FIXTURES
+    if not target or torch is None:
+        return
+    os.makedirs(target, exist_ok=True)
+    out = os.path.join(target, f"{name}.pt")
+    try:
+        torch.save(_fixture_to_cpu(payload), out)
+        sz = os.path.getsize(out)
+        print(f"[fixture] {name} -> {out} ({sz / 1e6:.2f} MB)", flush=True)
+    except Exception as exc:
+        print(f"[fixture] WARN failed to dump {name}: {exc}", flush=True)
+    stop_after = os.environ.get("PIXAL3D_STOP_AFTER", "").strip()
+    if stop_after and name == stop_after:
+        print(f"[fixture] PIXAL3D_STOP_AFTER={stop_after} matched; exiting.",
+              flush=True)
+        sys.exit(0)
+
+
+def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
+    """Monkey-patch pipeline stage methods to dump outputs after each call."""
+    import functools
+
+    stage_map = {
+        "sample_sparse_structure":   "02_sparse_structure",
+        "sample_shape_slat":         "03a_shape_slat",
+        "sample_shape_slat_cascade": "03b_shape_slat_cascade",
+        "decode_shape_slat":         "04_shape_slat_decoded",
+        "sample_tex_slat":           "05_tex_slat",
+        "decode_tex_slat":           "06_tex_slat_decoded",
+    }
+    call_counter: dict[str, int] = {n: 0 for n in stage_map.values()}
+
+    for method_name, fixture_name in stage_map.items():
+        original = getattr(pipeline, method_name, None)
+        if original is None or not callable(original):
+            continue
+
+        def make_wrapper(orig, fname):
+            @functools.wraps(orig)
+            def wrapped(*args, **kwargs):
+                result = orig(*args, **kwargs)
+                idx = call_counter[fname]
+                call_counter[fname] += 1
+                tag = fname if idx == 0 else f"{fname}_call{idx}"
+                _dump_fixture(tag, result, fixture_dir=fixture_dir)
+                return result
+            return wrapped
+
+        setattr(pipeline, method_name, make_wrapper(original, fixture_name))
+    print(f"[fixture] pipeline stage hooks installed -> {fixture_dir}", flush=True)
+
+    # --- per-step sampler dumps -------------------------------------------
+    # Monkey-patch FlowEulerSampler.sample (the base method that the CFG and
+    # GuidanceInterval subclasses delegate to via super().sample(...)) so we
+    # capture every intermediate pred_x_t / pred_x_0 of the 12 denoising
+    # steps.  Fixture names are derived from tqdm_desc so dumps from
+    # different samplers (sparse-structure, shape SLat, HR shape SLat,
+    # texture SLat) land in distinct files.
+    try:
+        from pixal3d.pipelines.samplers.flow_euler import FlowEulerSampler
+    except Exception as exc:
+        print(f"[fixture] WARN: cannot import FlowEulerSampler ({exc}); "
+              "per-step dumps disabled.", flush=True)
+        return
+
+    if getattr(FlowEulerSampler.sample, "_pixal3d_patched", False):
+        return  # already patched (e.g. hooks installed twice)
+
+    import re
+    _desc_to_tag = [
+        ("hr shape slat",     "03b_shape_slat_cascade"),
+        ("sparse structure",  "02_sparse_structure"),
+        ("shape slat",        "03a_shape_slat"),
+        ("texture slat",      "05_tex_slat"),
+    ]
+    def _tag_from_desc(desc: str) -> str:
+        d = (desc or "").lower()
+        for needle, tag in _desc_to_tag:
+            if needle in d:
+                return tag
+        return "xx_" + re.sub(r"[^a-z0-9]+", "_", d).strip("_") or "xx_unknown"
+
+    sampler_call_counter: dict[str, int] = {}
+    original_sample = FlowEulerSampler.sample
+
+    @functools.wraps(original_sample)
+    def patched_sample(self, *args, **kwargs):
+        # tqdm_desc may arrive as a kwarg or as the 6th positional arg
+        # (model, noise, cond, steps, rescale_t, verbose, tqdm_desc, ...).
+        desc = kwargs.get("tqdm_desc", "Sampling")
+        result = original_sample(self, *args, **kwargs)
+        tag = _tag_from_desc(desc)
+        idx = sampler_call_counter.get(tag, 0)
+        sampler_call_counter[tag] = idx + 1
+        call_suffix = "" if idx == 0 else f"_call{idx}"
+        try:
+            pred_x_t = list(result.pred_x_t) if hasattr(result, "pred_x_t") else []
+            pred_x_0 = list(result.pred_x_0) if hasattr(result, "pred_x_0") else []
+        except Exception:
+            pred_x_t, pred_x_0 = [], []
+        n = min(len(pred_x_t), len(pred_x_0))
+        for i in range(n):
+            step_name = f"{tag}{call_suffix}_step{i:02d}"
+            _dump_fixture(step_name,
+                          {"pred_x_t": pred_x_t[i], "pred_x_0": pred_x_0[i]},
+                          fixture_dir=fixture_dir)
+        return result
+
+    patched_sample._pixal3d_patched = True  # idempotency marker
+    FlowEulerSampler.sample = patched_sample
+    print("[fixture] FlowEulerSampler.sample patched for per-step dumps.",
+          flush=True)
+
+
+def _dump_run_metadata(fixture_dir: str, *, image_path: str, args_dict: dict,
+                       seed: int) -> None:
+    """Write 00_metadata.json."""
+    import json
+    import hashlib
+    import platform
+
+    os.makedirs(fixture_dir, exist_ok=True)
+    try:
+        with open(image_path, "rb") as f:
+            image_sha256 = hashlib.sha256(f.read()).hexdigest()
+        image_size = os.path.getsize(image_path)
+    except OSError:
+        image_sha256 = None
+        image_size = None
+
+    device_kind = "mps" if (torch is not None and getattr(torch.backends, "mps", None)
+                            and torch.backends.mps.is_available()) else "cpu"
+    meta = {
+        "image_path": os.path.abspath(image_path),
+        "image_sha256": image_sha256,
+        "image_size_bytes": image_size,
+        "seed": seed,
+        "args": args_dict,
+        "torch_version": torch.__version__ if torch is not None else "?",
+        "device_kind": device_kind,
+        "device_name": "Apple Silicon",
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "env": {k: os.environ.get(k) for k in [
+            "ATTN_BACKEND", "SPARSE_CONV_BACKEND", "SPARSE_ATTN_BACKEND",
+            "PIXAL3D_DUMP_FIXTURES",
+        ] if os.environ.get(k) is not None},
+    }
+    out = os.path.join(fixture_dir, "00_metadata.json")
+    with open(out, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[fixture] metadata -> {out}", flush=True)
 
 
 def _configure_mps_environment():
@@ -704,13 +897,26 @@ def parse_args():
         nargs="?",
         default=None,
         help=(
-            "Path to input image.  Required unless --load-mesh PATH is given."
+            "Path to input image.  Required unless --load-mesh PATH or "
+            "--load-fixture-07 PATH is given."
+        ),
+    )
+    parser.add_argument(
+        "--load-fixture-07", type=str, default=None,
+        help=(
+            "Load a stage-07 fixture (`07_run_output.pt`) and replay only the "
+            "downstream post-pipeline (pamo_simplify + texture bake + GLB "
+            "export).  Used to isolate whether artifacts come from upstream "
+            "DiT/VAE numerics or from the Mac post-pipeline code."
         ),
     )
     parser.add_argument("--output", default="output_3d", help="Output GLB path or basename (default: output_3d)")
     parser.add_argument("--model-path", default=MODEL_PATH, help="Pixal3D model path or Hugging Face repo")
     parser.add_argument("--device", choices=["mps", "cpu"], default="mps", help="Runtime device (default: mps)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    parser.add_argument("--fov", type=float, default=-1.0,
+                        help="Manual camera FOV in radians.  >0 bypasses MoGe-2 entirely "
+                             "(use e.g. 0.5).  Default -1.0 keeps MoGe.")
     parser.add_argument("--pipeline-type", choices=["1024_cascade", "1536_cascade"], default="1024_cascade")
     parser.add_argument("--steps", type=int, default=None, help="Override sampler steps for all stages")
     parser.add_argument("--ss-steps", type=int, default=None, help="Sparse-structure sampler steps")
@@ -985,6 +1191,79 @@ def load_mesh_checkpoint(path):
     return mesh, vertices, faces, resolution
 
 
+
+def load_stage_07_fixture(path, resolution: int = 1024):
+    """Load a ``07_run_output.pt`` fixture and reconstruct a mesh wrapper
+    suitable for the post-pipeline export path.
+
+    Used by ``--load-fixture-07`` to replay only the downstream (mesh
+    extraction + simplification + texture bake + GLB write) part of the
+    pipeline against a pre-recorded run.  Lets us isolate whether visible
+    artifacts come from the upstream DiT/VAE numerics or from the
+    post-pipeline code on Mac (FDG→mesh fallback, pamo_simplify,
+    texture bake).
+
+    The fixture's ``mesh`` is saved as a dict because ``_fixture_to_cpu``
+    walks ``__dict__`` of unknown classes; the returned ``_LoadedMesh``
+    re-wraps those tensors with the attributes the export path expects.
+
+    ``origin`` and ``voxel_size`` are not in the dump (likely class
+    properties on the original MeshWithVoxel) so we synthesise the
+    canonical AABB-[-0.5,0.5] grid values used throughout the pipeline.
+    """
+    # Inject a stub for the CUDA-only class that the cuda-side fixture
+    # references in its pickle.  Without this, torch.load raises
+    # ModuleNotFoundError on flex_gemm even though the actual data we
+    # want (mesh tensors) doesn't depend on the cache.
+    import types as _types
+    for _modpath in ("flex_gemm", "flex_gemm.ops", "flex_gemm.ops.spconv",
+                     "flex_gemm.ops.spconv.submanifold_conv3d"):
+        if _modpath not in sys.modules:
+            sys.modules[_modpath] = _types.ModuleType(_modpath)
+    _stub_mod = sys.modules["flex_gemm.ops.spconv.submanifold_conv3d"]
+    if not hasattr(_stub_mod, "SubMConv3dNeighborCache"):
+        class _PickleStub:
+            def __setstate__(self, state):
+                if isinstance(state, dict):
+                    self.__dict__.update(state)
+                else:
+                    self.__dict__["_state"] = state
+            def __reduce__(self):
+                return (self.__class__, ())
+        _stub_mod.SubMConv3dNeighborCache = type(
+            "SubMConv3dNeighborCache", (_PickleStub,),
+            {"__module__": "flex_gemm.ops.spconv.submanifold_conv3d"})
+
+    payload = torch.load(str(path), weights_only=False, map_location="cpu")
+    mesh_dict = payload["mesh"]
+    if not isinstance(mesh_dict, dict):
+        # Real MeshWithVoxel survived the round-trip; fall back to
+        # treating it as such.
+        mesh_dict = {k: v for k, v in mesh_dict.__dict__.items()}
+
+    res = int(payload.get("res", resolution))
+
+    mesh = _LoadedMesh()
+    mesh.vertices = mesh_dict["vertices"].float()
+    mesh.faces = mesh_dict["faces"].to(torch.int32)
+    mesh.coords = mesh_dict["coords"].to(torch.int32)
+    mesh.attrs = mesh_dict["attrs"].float()
+    # Canonical AABB-[-0.5, 0.5] sparse grid (matches what TRELLIS.2 /
+    # Pixal3D use throughout the pipeline).  Always reconstructable from
+    # the resolution; not stored in the fixture.
+    mesh.origin = torch.tensor([-0.5, -0.5, -0.5], dtype=torch.float32)
+    mesh.voxel_size = 1.0 / float(res)
+    # FDG re-extraction tensors are not in this fixture; leave None so
+    # the reextract path is gracefully unavailable.
+    for attr in ("fdg_coords", "fdg_dual_vertices",
+                 "fdg_intersected", "fdg_split_weight"):
+        setattr(mesh, attr, None)
+
+    vertices = mesh.vertices.detach().cpu().numpy()
+    faces = mesh.faces.detach().cpu().numpy().astype(np.int32)
+    return mesh, vertices, faces, res
+
+
 def reextract_mesh_from_fdg(mesh, resolution: int):
     if any(getattr(mesh, attr, None) is None for attr in (
         "fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight",
@@ -1020,6 +1299,9 @@ def main():
     glb_path.parent.mkdir(parents=True, exist_ok=True)
 
     load_runtime_deps()
+    if PIXAL3D_DUMP_FIXTURES:
+        _dump_run_metadata(PIXAL3D_DUMP_FIXTURES, image_path=args.image or "",
+                           args_dict=vars(args), seed=args.seed)
     device = resolve_device(args.device)
 
     print("=" * 60)
@@ -1032,8 +1314,18 @@ def main():
     t0 = time.time()
     pipeline = None
     from_checkpoint = bool(args.load_mesh)
+    from_fixture = bool(args.load_fixture_07)
 
-    if from_checkpoint:
+    if from_fixture:
+        fx_path = Path(args.load_fixture_07)
+        if not fx_path.exists():
+            raise SystemExit(f"Stage-07 fixture not found: {fx_path}")
+        print(f"[Fixture-07] Loading mesh from {fx_path}")
+        mesh, vertices, faces, resolution = load_stage_07_fixture(
+            fx_path, resolution=1024)
+        print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles "
+              f"(resolution={resolution}) — skipping upstream pipeline.")
+    elif from_checkpoint:
         ckpt_path = Path(args.load_mesh)
         if not ckpt_path.exists():
             raise SystemExit(f"Mesh checkpoint not found: {ckpt_path}")
@@ -1046,7 +1338,8 @@ def main():
     else:
         if not args.image:
             raise SystemExit(
-                "An input image is required unless --load-mesh PATH is given"
+                "An input image is required unless --load-mesh PATH or "
+                "--load-fixture-07 PATH is given"
             )
         input_path = Path(args.image)
         if not input_path.exists():
@@ -1054,41 +1347,92 @@ def main():
 
         pipeline = init_pipeline(args.model_path, device)
 
-        print("[MoGe] Loading camera estimator...")
-        moge_model = load_moge_model(device)
-
         print(f"[Input] {input_path}")
         image = Image.open(input_path)
         image_preprocessed = pipeline.preprocess_image(image)
+        _dump_fixture("00_preprocessed_image", {
+            "mode": image_preprocessed.mode,
+            "size": image_preprocessed.size,
+            "pixels": np.array(image_preprocessed),
+        })
 
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=str(glb_path.parent))
-        tmp_path = Path(tmp_file.name)
-        tmp_file.close()
-        try:
-            image_preprocessed.save(tmp_path)
-            print("[MoGe] Estimating camera parameters...")
-            camera_params = get_camera_params_wild_moge(
-                tmp_path,
-                moge_model,
-                device=device,
-                mesh_scale=args.mesh_scale,
-                extend_pixel=args.extend_pixel,
-                image_resolution=args.image_resolution,
+        if args.fov > 0:
+            # Manual FOV: bypass MoGe entirely.  Matches the formula used by
+            # Pixal3D_fresh/inference.py so CUDA-vs-MPS captures stay aligned.
+            camera_angle_x = float(args.fov)
+            grid_point = torch.tensor([-1.0, 0.0, 0.0])
+            target_point = torch.tensor(
+                [0 - args.extend_pixel,
+                 args.image_resolution - 1 + args.extend_pixel]
             )
-        finally:
+            distance = distance_from_fov(
+                camera_angle_x, grid_point, target_point,
+                args.mesh_scale, args.image_resolution,
+            )["distance_from_x"]
+            camera_params = {
+                "camera_angle_x": camera_angle_x,
+                "distance": distance,
+                "mesh_scale": args.mesh_scale,
+            }
+            print(f"[Manual FOV] {math.degrees(args.fov):.2f}° "
+                  f"({args.fov:.4f} rad), distance={distance:.4f}")
+        else:
+            print("[MoGe] Loading camera estimator...")
+            moge_model = load_moge_model(device)
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=str(glb_path.parent))
+            tmp_path = Path(tmp_file.name)
+            tmp_file.close()
             try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
+                image_preprocessed.save(tmp_path)
+                print("[MoGe] Estimating camera parameters...")
+                camera_params = get_camera_params_wild_moge(
+                    tmp_path,
+                    moge_model,
+                    device=device,
+                    mesh_scale=args.mesh_scale,
+                    extend_pixel=args.extend_pixel,
+                    image_resolution=args.image_resolution,
+                )
+            finally:
+                try:
+                    tmp_path.unlink()
+                except FileNotFoundError:
+                    pass
+            del moge_model
+            maybe_empty_cache(device)
+            print(f"[MoGe] camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
 
-        del moge_model
-        maybe_empty_cache(device)
-        print(f"[MoGe] camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
+        _dump_fixture("01_camera_params", camera_params)
 
         torch.manual_seed(args.seed)
         print(f"[Generate] pipeline={args.pipeline_type}, seed={args.seed}")
+        if PIXAL3D_DUMP_FIXTURES:
+            _install_pipeline_fixture_hooks(pipeline, PIXAL3D_DUMP_FIXTURES)
+
+        # PIXAL3D_SDPA_BACKEND=math|efficient|flash pins torch's SDPA path
+        # for this run.  Lets us isolate whether MPS's fused attention paths
+        # are the source of CUDA-vs-MPS divergence.  Unset = backend default.
+        _sdpa_choice = os.environ.get("PIXAL3D_SDPA_BACKEND", "").strip().lower()
+        _sdpa_ctx = nullcontext()
+        if _sdpa_choice:
+            try:
+                import torch.nn.attention as _ta
+                _sdpa_map = {
+                    "math":      _ta.SDPBackend.MATH,
+                    "efficient": _ta.SDPBackend.EFFICIENT_ATTENTION,
+                    "flash":     _ta.SDPBackend.FLASH_ATTENTION,
+                }
+                if _sdpa_choice in _sdpa_map:
+                    _sdpa_ctx = _ta.sdpa_kernel([_sdpa_map[_sdpa_choice]])
+                    print(f"[SDPA] pinning attention to '{_sdpa_choice}'", flush=True)
+                else:
+                    print(f"[SDPA] WARN unknown PIXAL3D_SDPA_BACKEND='{_sdpa_choice}'; using default", flush=True)
+            except Exception as _exc:
+                print(f"[SDPA] WARN sdpa_kernel unavailable ({_exc}); using default", flush=True)
+
         t_gen = time.time()
         try:
+          with _sdpa_ctx:
             mesh_list, (shape_slat, tex_slat, resolution) = pipeline.run(
                 image_preprocessed,
                 camera_params=camera_params,
@@ -1108,6 +1452,12 @@ def main():
             raise
 
         mesh = mesh_list[0]
+        _dump_fixture("07_run_output", {
+            "mesh": mesh,
+            "shape_slat": shape_slat,
+            "tex_slat": tex_slat,
+            "res": resolution,
+        })
         vertices = mesh.vertices.detach().cpu().numpy()
         faces = mesh.faces.detach().cpu().numpy()
         if vertices.shape[0] == 0 or faces.shape[0] == 0:
