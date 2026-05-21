@@ -222,19 +222,93 @@ boundaries.  The "skips winding-flip rejection / drives mesh below target
    upstream numerics contribute, but they are not the dominant visible
    cause.  Hold this for after pamo_simplify is finished.
 
+## Texture-VAE precision finding (later session)
+
+Element-wise diff of `06_tex_slat_decoded.pt` between CUDA and MPS over
+the ~28% of voxels where coords agree:
+
+* max abs diff: **1.21** (out of value range ~1.1 — i.e. up to 100% of
+  the scale)
+* mean abs diff: **0.12** (~10% of value range)
+* per-channel mean abs diff: 0.09 / 0.10 / 0.09 / **0.23 / 0.16** / 0.05
+  (channels 3 and 4 worst — likely metallic/roughness PBR)
+
+Ran a controlled fp32 ablation: `PIXAL3D_FP32_MODELS=tex_slat_decoder`
+(plus input-feats autocast + self.dtype / use_fp16 attr flip to bypass
+the model's internal `h.type(self.dtype)` re-downcast).
+
+Result: fp32-tex output is bit-for-bit nearly identical to the bf16
+baseline (MPS-baseline vs MPS-fp32-tex max abs **3.3e-3**, mean
+**1.9e-4** = noise floor).  The CUDA-vs-MPS divergence (max 1.15,
+mean 0.108) is **completely unchanged** by the fp32 cast.
+
+**Precision is NOT the cause of the texture quality gap.**  The model
+is already effectively running at fp32 on MPS (params load as fp32 even
+from the `_fp16.safetensors` checkpoint; the `.float()` cast is a no-op
+for params, only the `self.dtype` attribute was forcing a downcast and
+flipping it doesn't change activations).
+
+What remains as the cause: **sparse conv backend differences**.  CUDA
+runs `flex_gemm`'s submanifold sparse conv kernel; MPS runs
+`pixal3d/modules/sparse/conv/conv_none.py`'s naive
+`feats[sources] @ weights[idx]`.  These are different *algorithms* (not
+just different precision implementations of the same one); they
+produce numerically different outputs by design.  The 0.05-0.23
+per-channel divergence accumulates through every conv layer in the
+texture VAE.
+
+This narrows the texture-quality fix to one of:
+1. Port `flex_gemm`'s submanifold sparse conv to Metal (1-3 months
+   per the earlier feasibility note).
+2. Find a CPU sparse-conv implementation that matches CUDA's flex_gemm
+   semantics more faithfully than `conv_none.py` (MinkowskiEngine CPU,
+   torch-sparse CPU — these are algorithmically faithful to CUDA
+   spconv, slow but correct).
+3. Accept the texture drift as backend-fundamental.
+
+## FDG NME pre-clean finding (later session)
+
+Tested `PIXAL3D_PRECLEAN_NME=1` (runs `cumesh_port.repair_non_manifold_
+edges` on the FDG-extracted mesh BEFORE `to_glb` is called).  Hypothesis:
+pre-cleaning the 904k pre-existing NMEs would reduce the cleanup-chain
+damage inside `to_glb`.
+
+Preclean DID work as intended: mesh inflated from 4.67M → 6.74M verts
+(+2.07M from NME splits) before `to_glb`.  Then `to_glb`'s internal
+`repair_nme` only added +8K verts (vs +1.53M without preclean) — same
+work, done earlier.
+
+But the **final visible quality is essentially unchanged** (slightly
+fewer total loops, but slightly LARGER worst-case hole: 9.15m → 10.35m
+top perimeter).  Reordering when `repair_nme` happens doesn't fix the
+underlying problem.
+
+## Summary of the quality gap
+
+Two distinct sources, both algorithmic (not precision/RNG/MoGe):
+
+| Quality dimension | Source | Estimated effort to fix |
+|---|---|---|
+| **Geometry damage** (broken lantern, fragmenting at fine features) | pamo+repair_nme+small_cc+fill_holes interaction on the NME-heavy FDG mesh; tuning each parameter individually plateaus around 1 voxel topology drift; reordering doesn't help.  Root cause is that **QEM-based simplification on a 7.4% NME input inflates the NME fraction by collapse-boundary creation**, regardless of port. | Hard — would need a fundamentally different simplifier (not QEM) or a pre-process that delivers a clean (low-NME) input to QEM.  Months of algorithm work. |
+| **Texture muting/blur** | `pixal3d/modules/sparse/conv/conv_none.py`'s naive `feats[sources] @ weights[idx]` is a **different algorithm** from CUDA's `flex_gemm` submanifold sparse conv.  Produces ~10% mean-abs-Δ on tex VAE outputs by design.  Precision (bf16 vs fp32) is NOT the cause — controlled fp32 test gave bit-identical output. | Large — port `flex_gemm` to Metal (1-3 months) or swap in MinkowskiEngine CPU / torch-sparse CPU as a slow-but-faithful drop-in. |
+
 ## Open questions
 
 * **`flexible_dual_grid_to_mesh` (Mac CPU fallback) faithfulness.**  Does
   it produce the same active-voxel → triangle-strip output as the CUDA
   kernel for the same SparseTensor input?  Would need direct comparison
   with a CUDA-extracted reference mesh.
-* **Texture-VAE drift profile.**  Confirmed numerically?  The original
-  `fixtures/cuda/06_tex_slat_decoded.pt` vs `fixtures/mps/...` can be
-  diffed; we just haven't.
 * **Whether the same DiT drift profile shows up in the shape-SLat
   sampler (stage 03a) on its own**, when fed an identical sparse-structure
   topology.  Currently the topology drift from stage 02 makes the diff
   at stage 03a a shape-mismatch and prevents element-wise comparison.
+* **What does `conv_none.py`'s `feats[sources] @ weights[idx]` produce
+  vs flex_gemm for a single isolated layer**, when fed the same input?
+  Direct comparison would quantify per-layer drift contribution.
+* **Does MinkowskiEngine CPU or torch-sparse CPU produce CUDA-equivalent
+  sparse-conv output**?  Drop-in test would tell us whether replacing
+  `conv_none.py` with a faithful (but slow) CPU implementation closes
+  the texture gap without requiring Metal porting.
 
 ## Repro
 

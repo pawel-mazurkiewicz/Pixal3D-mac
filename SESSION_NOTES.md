@@ -727,3 +727,162 @@ session).
 * `get_edge_collapse_cost` with flip-reject + λ_edge + λ_skinny:
   22.7 s.  94.6 % of edges finite; 5.4 % rejected (mostly flip or
   degree-cap on non-manifold vertices).
+
+---
+
+## Session 5 log — divergence hunt + downstream investigation + tex-VAE precision
+
+(2026-05-20 → 2026-05-21.  Companion docs created this session:
+`DIVERGENCE_FINDINGS.md` for the full divergence-hunt report,
+`NEXT_STEPS.md` for the prioritised candidate-directions list,
+`LIB_PORT_NOTES.md` for preserved chat context.  WIP commit `e74ba5d`.)
+
+### Goal
+
+Phase 6 of PAMO_PORT_PLAN.md called for CUDA-vs-MPS divergence analysis
+to localize the source of the persistent quality gap.  This session
+executed that analysis end-to-end (on a rented RTX 4090), instrumented
+the pipeline, ran controlled ablations, then pivoted to the texture-VAE
+precision investigation.
+
+### Infrastructure added
+
+CLI / env-var surface for the divergence-hunt and downstream tuning:
+
+| Switch | Purpose |
+|---|---|
+| `--fov FLOAT` | Manual FOV, bypasses MoGe-2 entirely (mirrors `inference.py`) |
+| `--load-fixture-07 PATH` | Load a `07_run_output.pt` fixture and replay only the post-pipeline (skip the slow ~8 min generation) — isolation test for downstream damage |
+| `PIXAL3D_DUMP_FIXTURES=DIR` | Per-stage fixture dump (was already in place; added per-step sampler hooks: dumps `pred_x_t` + `pred_x_0` after every one of 12 denoising steps for sparse-structure + shape-SLat + HR-shape-SLat + texture-SLat samplers) |
+| `PIXAL3D_STOP_AFTER=<stage>` | Clean early-exit after a named fixture is dumped (e.g. `=03a_shape_slat`) |
+| `PIXAL3D_SDPA_BACKEND=math|efficient|flash` | Pin SDPA backend (turned out a no-op on MPS as of torch 2.12) |
+| `PIXAL3D_FP32_MODELS=<comma-list>` | Selective fp32 weight upcast per pipeline submodel + matching input-feats autocast wrapper on `decode_tex_slat` / `decode_shape_slat` |
+| `PIXAL3D_FILL_HOLES_PERIMETER=<float>` | Override `_MeshBackend.fill_holes` perimeter threshold via CPU port |
+| `PIXAL3D_SMALL_CC=noop|<float>` | Override `_MeshBackend.remove_small_connected_components` (noop or custom min_area) via CPU port |
+| `PIXAL3D_PRECLEAN_NME=1` | Run `cumesh_port.repair_non_manifold_edges` on the FDG mesh BEFORE `to_glb` is called (drafted; not yet tested as of this writing) |
+
+`run_mps_capture.sh` patched to respect caller-set `ATTN_BACKEND` /
+`SPARSE_ATTN_BACKEND` (was previously unconditional `export …=sdpa`).
+
+### Captures collected
+
+CUDA rentals + Mac runs at seed 42, image `assets/images/1_img.png`,
+resolution 1024.  All directories under `/Users/pawelma/code/ai/fixtures/`:
+
+| Dir | Side | MoGe | Per-step | Notes |
+|---|---|---|---|---|
+| `cuda` | A4000 | on | — | Original capture; only full set including stage 08 |
+| `mps` | M5 | on | — | Original capture; missing stage 08 (Phase 6 blocker) |
+| `fixtures_cuda_moge` | 4090 | on | yes | Early-exit at 03a, per-step sweep |
+| `fixtures_cuda_nofov` | 4090 | off | yes | Early-exit at 03a, MoGe bypassed |
+| `mps_moge` | M5 | on | yes | Early-exit at 03a |
+| `mps_nofov` | M5 | off | yes | Early-exit at 03a |
+| `mps_nofov_sdpa_{math,efficient,flash}` | M5 | off | yes | SDPA backend sweep |
+| `mps_nofov_naive` | M5 | off | yes | `ATTN_BACKEND=naive` (unfused) |
+| `mps_full_nofov` | M5 | off | full | End-to-end MoGe-off; produced visible-quality GLB |
+| `mps_full_nofov_undecimated` | M5 | off | full | `--skip-decimation` (covered-in-confetti result) |
+| `mps_replay_cuda07` | M5 | (CUDA-mesh) | n/a | CUDA mesh fed through Mac post-pipeline |
+| `mps_replay_cuda07_{fh01,smcc1e7,combo,smccnoop,fallback}` | M5 | (CUDA-mesh) | n/a | Post-pipeline-parameter sweep |
+| `mps_full_nofov_tex_fp32` | M5 | off | up to 06 | tex_slat_decoder upcast to fp32 (running at session end) |
+
+### What got proven and ruled out
+
+For the per-step DiT divergence (stage 02 sparse-structure sampler):
+
+| Hypothesis | Result |
+|---|---|
+| MoGe-2 produces different camera params | YES (~5e-4 to 1.5e-3 Δ on `camera_angle_x` / `distance`), but bypassing MoGe (`--fov 0.5`) didn't close the stage-02 topology gap, only shrank it 11× (Δ 11 voxels → Δ 1 voxel) |
+| Same-seed RNG diverges between CUDA / MPS | Inconsistent with data: divergence appears at step 0, before any sampler-internal RNG |
+| bf16 weights cause MPS reduction precision loss | Provisionally falsified: probe showed all model parameters already report `torch.float32` after `from_pretrained` on MPS.  Force-all-fp32 crashed Metal at NDArrayMatrixMultiplication |
+| MPS's fused SDPA backend is the culprit | All three `sdpa_kernel(MATH|EFFICIENT|FLASH)` variants produced **bit-identical** MPS output — the context manager is a no-op on MPS as of torch 2.12 |
+| Fused vs unfused attention is the culprit | `ATTN_BACKEND=naive` made things *slightly worse*, not better |
+
+What survived: **pervasive numerical drift across the DiT forward pass**
+(LayerNorm/RMSNorm reductions + GEMM rounding order + RoPE sin/cos
+accuracy on MPS).  Not a single broken kernel.  ~0.3 max-abs-Δ on
+`pred_x_0` at step 0 with byte-identical input.
+
+For the downstream cleanup:
+
+The CUDA-stage-07 → Mac-post-pipeline replay produced a GLB with holes
+in arched openings even though the input mesh was CUDA-clean.  Damage
+chain: pamo collapses → `repair_nme` adds +2.5M verts → `small_cc(1e-5)`
+culls 2.19M as dust → `fill_holes(3e-2)` only recovers ~370k pinpricks
+→ ~1M faces of real surface permanently gone.
+
+Six tuning variants (`PIXAL3D_FILL_HOLES_PERIMETER` ∈ {default, 0.1, 0.3},
+`PIXAL3D_SMALL_CC` ∈ {default, 1e-7, noop}, combos, `--force-texture-
+fallback`) all land within 2-3× of each other on hole metrics:
+
+| Variant | Boundary edges | Loops | Big (>5cm) | Huge (>15cm) | Top perim |
+|---|---|---|---|---|---|
+| A (CUDA reference) | 626K | 51,707 | 7,960 | 1,880 | 5.41m |
+| B (Mac full, MoGe-off) | 766K | 95,541 | 6,378 | 1,294 | 9.15m |
+| C (CUDA→Mac post defaults) | 747K | 101,563 | 5,649 | 947 | 3.37m |
+| D (PIXAL3D_FILL_HOLES_PERIMETER=0.1) | 943K | 149,358 | 6,317 | 952 | **2.20m** |
+| E (PIXAL3D_SMALL_CC=1e-7) | 1.13M | 225,611 | 5,420 | **899** | 2.37m |
+| F (E + D combo) | 1.11M | 211,856 | 6,113 | 922 | 2.44m |
+| G (smcc=noop + fh=0.3) | 1.07M | 200,315 | 7,437 | 942 | 2.35m |
+| H (--force-texture-fallback) | 2.70M | (different topo)| 7,231 | 2,243 | (different topo) |
+
+Practical recommendation: **`PIXAL3D_SMALL_CC=1e-7`** preserves the most
+fine detail (lantern hood, decorative spires) at the cost of more
+small-perimeter noise; the absolute worst-hole metric stays in the same
+range as default.  No single-parameter fix solves the structural
+problem.
+
+### Texture-VAE finding (motivation for the in-flight test)
+
+Element-wise diff of `06_tex_slat_decoded.pt` (CUDA vs MPS, MoGe-on
+captures) over the 28% of voxels where coords agree:
+
+* max abs diff: **1.21** (out of value range ~1.1)
+* mean abs diff: **0.12** (~10% of value range)
+* per-channel mean abs diff: 0.09 / 0.10 / 0.09 / **0.23 / 0.16** / 0.05
+  (channels 3 and 4 worst — likely metallic / roughness PBR)
+
+This is the "muted/blurry texture" half of the user-reported quality
+gap.  **NOT bf16 noise** — fundamental disagreement.  Hypothesis being
+tested: precision drift inside the tex-VAE decoder (the disk weights
+were `tex_dec_next_dc_f16c32_fp16.safetensors`, though `next(parameters()).
+dtype` reports fp32 after load — possibly mixed-dtype state in buffers
+or non-parameter tensors).
+
+Test in flight: `PIXAL3D_FP32_MODELS=tex_slat_decoder` + input-feats
+autocast wrapper, full pipeline up to stage 06.  Compare 06 fixture
+against baseline.  If divergence shrinks, this is the precision fix
+path; if not, the texture VAE has algorithm-level mismatch.
+
+### What's next
+
+Per `NEXT_STEPS.md` (this session's planning doc, ordered by ROI):
+
+1. **Texture-VAE precision focus** (in flight) — `PIXAL3D_FP32_MODELS=
+   tex_slat_decoder` test, compare 06_tex_slat_decoded against baseline.
+2. **Pre-clean FDG NMEs before pamo runs** — `PIXAL3D_PRECLEAN_NME=1`
+   patch drafted, not yet tested.  Run `cumesh_port.repair_nme` on the
+   FDG mesh before `to_glb` is called.
+3. `flexible_dual_grid_to_mesh` CPU-fallback audit
+4. Phase 7 — pamo on MPS device for speed
+5. Per-layer DiT instrumentation
+6. CUDA cumesh `repair_nme` vs CPU port audit
+
+### Key new heuristics for future sessions
+
+* **MPS `torch.nn.attention.sdpa_kernel()` is effectively a no-op** as
+  of torch 2.12 — all three backend pins produce bit-identical output.
+  Don't waste time on it.
+* **Naive (pure-Python) attention is slightly WORSE than fused SDPA**
+  on MPS for our model.  Not a useful ablation either.
+* **Forcing global fp32 weights crashes Metal**
+  (`NDArrayMatrixMultiplication`-destination/accumulator dtype
+  mismatch).  Targeted per-submodel `.float()` + input-autocast wrapper
+  (`PIXAL3D_FP32_MODELS`) is the workaround.
+* **Tuning post-pipeline parameters has marginal effect.**  All
+  variants land in the same metric range.  The structural cause is
+  upstream of the parameters.
+* **Three checkpoint levels exist** for different tuning needs:
+  per-stage fixtures (PIXAL3D_DUMP_FIXTURES) for model-decoder tuning,
+  `--save-mesh` for bake/UV/cleanup tuning, `--load-fixture-07` for
+  post-pipeline replay.  Future debug runs should ideally chain all
+  three so we don't pay the ~30 min cost twice.

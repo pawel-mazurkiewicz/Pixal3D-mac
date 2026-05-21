@@ -449,6 +449,97 @@ def init_pipeline(model_path: str, device: torch.device):
         if getattr(model, "use_naf_upsample", False):
             model._load_naf()
 
+    # PIXAL3D_FP32_MODELS=<comma-list> selectively upcasts named submodels to
+    # fp32.  Use case: testing whether a specific model's MPS bf16/fp16
+    # numerics are the source of visible artifacts (e.g. tex_slat_decoder
+    # for the muted/blurry texture issue identified in
+    # DIVERGENCE_FINDINGS.md).
+    #
+    # For each model in the list, ALSO wraps the corresponding pipeline
+    # call site so the SparseTensor input has its feats upcast to fp32
+    # before it enters the model.  Without that wrap, the model gets fp16
+    # input + fp32 weights → "expected mat1 and mat2 to have the same
+    # dtype" crash inside sparse_conv3d_forward.
+    fp32_models_env = os.environ.get("PIXAL3D_FP32_MODELS", "").strip()
+    if fp32_models_env:
+        names = [n.strip() for n in fp32_models_env.split(",") if n.strip()]
+        print(f"[FP32] PIXAL3D_FP32_MODELS={names} — upcasting selected submodels.")
+        for name in names:
+            sub = pipeline.models.get(name) if pipeline.models else None
+            if sub is None:
+                print(f"  WARN: {name!r} not in pipeline.models; skipping.")
+                continue
+            try:
+                before = next(sub.parameters()).dtype
+            except StopIteration:
+                print(f"  {name}: no parameters; skipping.")
+                continue
+            sub.float()
+            # The Pixal3D VAEs (SparseStructureLatentVAE, SparseStructureVAE,
+            # etc.) carry a self.dtype attribute and a `convert_to_fp32` method
+            # that controls explicit `h.type(self.dtype)` casts inside forward().
+            # `.float()` alone only updates parameters/buffers — those internal
+            # casts still pull `self.dtype=fp16` and re-downcast activations,
+            # producing "expected mat1 and mat2 to have the same dtype" at the
+            # first conv.  Flip both.
+            if hasattr(sub, "convert_to_fp32") and callable(sub.convert_to_fp32):
+                sub.convert_to_fp32()
+                print(f"  {name}: convert_to_fp32() called")
+            if hasattr(sub, "dtype"):
+                sub.dtype = torch.float32
+                print(f"  {name}: .dtype attr -> torch.float32")
+            if hasattr(sub, "use_fp16"):
+                sub.use_fp16 = False
+                print(f"  {name}: .use_fp16 attr -> False")
+            after = next(sub.parameters()).dtype
+            print(f"  {name}: param dtype {before} -> {after}")
+
+        # Map model name -> pipeline call site whose input(s) need fp32
+        # casting at the entry.  Each entry: list of (pipeline_method_name,
+        # arg_name_or_index_to_cast).
+        # Method -> list of arg positions to upcast.  decode_tex_slat
+        # takes (slat, subs) where subs is a List[SparseTensor]; both
+        # need casting.
+        call_site_map = {
+            "tex_slat_decoder": [("decode_tex_slat", 0), ("decode_tex_slat", 1)],
+            "shape_slat_decoder": [("decode_shape_slat", 0)],
+        }
+        import functools as _ft
+
+        def _cast_sparse_to_fp32(obj):
+            """Recursively upcast SparseTensor.data['feats'] (or torch.Tensor) to fp32."""
+            if torch.is_tensor(obj):
+                return obj.float() if obj.is_floating_point() else obj
+            if isinstance(obj, list):
+                return [_cast_sparse_to_fp32(x) for x in obj]
+            if isinstance(obj, tuple):
+                return tuple(_cast_sparse_to_fp32(x) for x in obj)
+            # Custom class with .data dict (SparseTensor)
+            if hasattr(obj, "data") and isinstance(obj.data, dict) and "feats" in obj.data:
+                feats = obj.data["feats"]
+                if torch.is_tensor(feats) and feats.is_floating_point() and feats.dtype != torch.float32:
+                    obj.data = dict(obj.data)
+                    obj.data["feats"] = feats.float()
+            return obj
+
+        for name in names:
+            for method_name, arg_pos in call_site_map.get(name, []):
+                original = getattr(pipeline, method_name, None)
+                if original is None or not callable(original):
+                    continue
+
+                def _make_wrapper(orig, pos):
+                    @_ft.wraps(orig)
+                    def wrapped(*args, **kwargs):
+                        if pos < len(args):
+                            args = list(args)
+                            args[pos] = _cast_sparse_to_fp32(args[pos])
+                            args = tuple(args)
+                        return orig(*args, **kwargs)
+                    return wrapped
+                setattr(pipeline, method_name, _make_wrapper(original, arg_pos))
+                print(f"  -> wrapped pipeline.{method_name}(arg[{arg_pos}]) to upcast input feats to fp32")
+
     return pipeline
 
 
@@ -1469,6 +1560,29 @@ def main():
 
         if args.save_mesh:
             save_mesh_checkpoint(args.save_mesh, mesh, vertices, faces, resolution)
+
+    # PIXAL3D_PRECLEAN_NME=1 runs repair_non_manifold_edges on the FDG-
+    # extracted mesh BEFORE to_glb's cleanup chain.  The FDG output has
+    # ~904k pre-existing NMEs that compound when pamo's QEM collapses add
+    # more NMEs on top.  Pre-cleaning produces a less-NME-heavy input for
+    # the to_glb pipeline, which should reduce the small_cc culling cascade.
+    # See PAMO_PORT_PLAN.md Phase 6 / NEXT_STEPS.md direction 2.
+    if os.environ.get("PIXAL3D_PRECLEAN_NME", "").strip() in ("1", "true", "yes"):
+        print("[Pre-clean] Running repair_non_manifold_edges on FDG mesh...")
+        from pixal3d.utils.cumesh_port.repair import repair_non_manifold_edges as _cpu_repair_nme
+        before_v = vertices.shape[0]
+        before_f = faces.shape[0]
+        _pre_t = time.time()
+        new_v, new_f = _cpu_repair_nme(vertices, faces.astype(np.int64), verbose=True)
+        new_f = new_f.astype(faces.dtype)
+        print(f"[Pre-clean] V {before_v:,} -> {new_v.shape[0]:,} "
+              f"(+{new_v.shape[0]-before_v:,}), F {before_f:,} -> {new_f.shape[0]:,}"
+              f" in {time.time()-_pre_t:.1f}s")
+        vertices = new_v
+        faces = new_f
+        if hasattr(mesh, "vertices") and isinstance(mesh.vertices, torch.Tensor):
+            mesh.vertices = torch.from_numpy(new_v).to(mesh.vertices.device).to(mesh.vertices.dtype)
+            mesh.faces = torch.from_numpy(new_f).to(mesh.faces.device).to(mesh.faces.dtype)
 
     has_voxels = hasattr(mesh, "attrs") and mesh.attrs is not None and hasattr(mesh, "coords") and mesh.coords is not None
     if args.no_texture or not has_voxels:
