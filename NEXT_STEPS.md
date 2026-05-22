@@ -13,7 +13,44 @@ Captured directions to pick from for future sessions.
 > The original session-2 ordering is preserved below for history; do not
 > work items #1 or #2 without new evidence.
 
-## In-flight / ordered next (post-session-7)
+## In-flight / ordered next (post-session-8)
+
+> **Session 8 closing (2026-05-22):** FDG extractor is **empirically
+> innocent.**  We vendored upstream's `flexible_dual_grid_to_mesh`
+> verbatim into `pixal3d/utils/mesh_extract.py`, replacing the suspect
+> `_lookup_sparse_voxels` searchsorted-based hashmap with a small
+> dict-based shim that mirrors `_C.hashmap_*_3d_cuda` semantics.  Then
+> we ran the new extractor on `checkpoints/1_img_fdg_cap.npz`'s saved
+> FDG inputs and compared against the OLD extractor's output that the
+> same checkpoint had stored.  **Result: bit-identical.**  Vertices
+> max-abs-diff = 0.0 across 3.8M points; 0 face mismatches across 8.4M
+> triangles.
+>
+> Conclusion: the audit's "no algorithmic gap" verdict was correct.
+> Session 7's "sieve = FDG extractor" was a *deduction* from
+> elimination (cleanup is innocent → extraction must be the bug), but
+> the deduction implicitly assumed Mac's FDG inputs matched CUDA's.
+> They don't.  **The sieve lives upstream of FDG extraction** — in
+> the MPS DiT/VAE producing different `(coords, dual_vertices,
+> intersected, split_weight)` than CUDA does for the same seed.  Same
+> upstream divergence flagged in sessions 5/6, not a new bug.
+>
+> Side effects of the vendoring:
+>  - `PIXAL3D_FDG_CAP_PARTIAL_QUADS` env flag and
+>    `--fdg-cap-partial-quads` CLI flag are now **inert no-ops** (the
+>    code path was dropped; upstream doesn't emit partial-quad tris and
+>    on real data they were only 193 of 8.4M faces anyway).  CLI flag
+>    parsing is left intact for back-compat; can be removed in cleanup.
+>  - `mesh_extract.py` is shorter and upstream-verbatim; no future
+>    debate about whether it's faithful (it is, by construction).
+>
+> **Top-of-queue for next session: capture CUDA-side stage-07 FDG
+> tensors on a one-time CUDA rental** so we can replay only Mac's
+> extractor + cleanup chain on CUDA's inputs.  Expected outcome based
+> on this session's finding: sealed shell.  That would
+> *independently* confirm from the other side that the sieve is
+> upstream of extraction, leaving the MPS DiT divergence as the sole
+> remaining target.
 
 > **Session 7 closing (2026-05-22):** Six findings, ordered by leverage:
 >
@@ -53,19 +90,64 @@ Captured directions to pick from for future sessions.
 >    bilinear sampling boundary handling, fp16/fp32 accumulators in
 >    DINOv3+NAF, texture bake step.  Don't conflate with geometry.
 
-1. **DONE — sieve localized to mesh extraction.**  Decisive test run
-   end of session 7 via `scratch/sieve_test_cleanup_only.py`: loaded
-   CUDA's stage-08 pre-extracted mesh, ran ONLY our Mac cleanup chain
-   (Pedro's Metal: `fill_holes → simplify → dedup → repair_nme →
-   small_cc → fill_holes_2 → simplify_target → unify`).  Result:
-   **sealed shell with one tiny hole** — equivalent to CUDA's own
-   cleaned mesh quality.  Cleanup chain runs in 1 second total.
-   → **The sieve culprit is `pixal3d/utils/mesh_extract.py` CPU
-   `flexible_dual_grid_to_mesh` fallback.**  Likely missing edge
-   cases for partial quads / degenerate cells / boundary handling vs
-   the CUDA o_voxel kernel.  Output saved at
+1. **PARTIAL — cleanup chain confirmed innocent (session 7), but the
+   "therefore FDG extractor is the culprit" deduction was REFUTED in
+   session 8.**  Session 7's decisive test
+   (`scratch/sieve_test_cleanup_only.py`) loaded CUDA's stage-08
+   pre-extracted mesh and ran ONLY our Mac cleanup chain (Pedro's
+   Metal: `fill_holes → simplify → dedup → repair_nme → small_cc →
+   fill_holes_2 → simplify_target → unify`).  Result: **sealed shell
+   with one tiny hole** — cleanup chain runs in 1s total and produces
+   CUDA-equivalent quality on CUDA's inputs.  That correctly retired
+   cleanup as a suspect.  But the inference "therefore extraction is
+   the bug" only holds if Mac's FDG inputs match CUDA's; session 8
+   has shown they don't (see top-of-file).  Output still at
    `fixtures/sieve_test_stage08/cleanup_only.glb`.
-2. **Next session START HERE — audit & fix the FDG extractor.**
+2. **DONE in session 8 — FDG extractor empirically exonerated.**
+   See top-of-file session-8 block.  Vendored upstream verbatim with
+   a dict hashmap shim; bit-identical to old extractor on the same
+   FDG inputs.  No remaining work in this layer.
+
+3. **Next session START HERE — capture CUDA-side stage-07 FDG tensors
+   on a CUDA rental box.**
+
+   `save_mesh_checkpoint` (`generate_mps.py:1431`) already saves
+   `fdg_coords / fdg_dual_vertices / fdg_intersected / fdg_split_weight`
+   alongside `vertices/faces`.  Run `generate_mps.py --save-mesh ...`
+   once on a CUDA rental with the same image+seed (`1_img.png`,
+   seed=42) and capture the resulting `.npz`.
+
+   With that fixture in hand, the diagnostic on Mac is ~3 seconds:
+
+   ```python
+   import numpy as np, torch
+   from pixal3d.utils.mesh_extract import flexible_dual_grid_to_mesh
+
+   d = np.load("cuda_stage07_fdg.npz")
+   v, f = flexible_dual_grid_to_mesh(
+       torch.from_numpy(d["fdg_coords"]).int(),
+       torch.from_numpy(d["fdg_dual_vertices"]).float(),
+       torch.from_numpy(d["fdg_intersected"]).bool(),
+       torch.from_numpy(d["fdg_split_weight"]).float(),
+       aabb=[[-0.5,-0.5,-0.5],[0.5,0.5,0.5]],
+       grid_size=int(d["resolution"]),
+   )
+   # then run the Mac cleanup chain and export GLB; compare to CUDA's GLB.
+   ```
+
+   Expected based on session 8's finding: **sealed shell**.  That
+   confirms from the input side that the sieve is upstream of FDG
+   extraction.  After that the only remaining target is the MPS DiT
+   divergence itself, which has been the parent problem since
+   sessions 5/6.
+
+4. **Original session-7 ordering preserved below for context.**
+
+### Retired from this queue (replaced by item 3 above)
+
+1. **DONE — sieve localized to mesh extraction.**  Refer to item 1
+   above for the corrected reading.
+2. **Audit & fix the FDG extractor.**
 
    Canonical reference source (found end of session 7):
    ```
@@ -125,16 +207,25 @@ Captured directions to pick from for future sessions.
 
 ## Suspect lists (split by symptom)
 
-### Geometry sieve (LOCALIZED — bug is in mesh extraction)
+### Geometry sieve (NOT in extraction or cleanup — must be upstream)
 
-- **`pixal3d/utils/mesh_extract.py` CPU `flexible_dual_grid_to_mesh`** —
-  this is the bug, confirmed end of session 7 via the stage-08 replay
-  test.  The cleanup chain is innocent.  Audit against the CUDA
-  reference (look at `CuMesh/` and upstream Pixal3D's o_voxel module
-  for the canonical kernel).  Likely missing logic: partial-quad
-  handling, degenerate-cell handling, NME-free output guarantees.
+Session 8 ruled out FDG extraction empirically; session 7 ruled out
+the cleanup chain with the stage-08 test.  Remaining target is the
+MPS DiT/VAE producing different `(fdg_coords, fdg_dual_vertices,
+fdg_intersected, fdg_split_weight)` than CUDA does for the same seed
+— the same upstream divergence flagged in sessions 5/6.
 
-### Retired suspects (confirmed innocent via stage-08 test)
+### Retired suspects (empirically confirmed innocent)
+
+- **`pixal3d/utils/mesh_extract.py:flexible_dual_grid_to_mesh`** —
+  session 8 vendored upstream verbatim with a dict hashmap shim,
+  reran the new extractor on `checkpoints/1_img_fdg_cap.npz`'s saved
+  FDG inputs, got **bit-identical** output to the old extractor that
+  the same checkpoint had stored.  Vertices max-abs-diff = 0.0 across
+  3.8M points; 0 face mismatches across 8.4M triangles.  Audit's
+  "no algorithmic gap" verdict empirically confirmed.
+
+### Cleanup-chain suspects (retired earlier via stage-08 test)
 
 - ~~Cleanup chain destroying good input~~ — session 7 stage-08 replay
   showed the chain produces a sealed shell when given CUDA's clean mesh.
