@@ -101,7 +101,7 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             intersected = h.replace(h.feats[..., 3:6] > 0)
             quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
             mesh = []
-            for v, i, q in zip(vertices, intersected, quad_lerp):
+            for h_item, v, i, q in zip(h, vertices, intersected, quad_lerp):
                 fdg_coords = v.coords[:, 1:]
                 fdg_dual_vertices = v.feats
                 fdg_intersected = i.feats
@@ -121,6 +121,13 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
                 mesh_item.fdg_dual_vertices = fdg_dual_vertices
                 mesh_item.fdg_intersected = fdg_intersected
                 mesh_item.fdg_split_weight = fdg_split_weight
+                # Also stash the raw per-batch-item mid-decoder features
+                # (before sigmoid / > 0 / softplus split).  Lets us isolate
+                # FDG-VAE-decoder divergence from threshold-flip divergence.
+                # feats[..., 0:3] are pre-sigmoid vertex offsets, [3:6] are
+                # pre-`>0` intersected logits (boundary-flip risk!),
+                # [6:7] is pre-softplus quad-lerp weight.
+                mesh_item.fdg_h_feats = h_item.feats
                 mesh.append(mesh_item)
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)

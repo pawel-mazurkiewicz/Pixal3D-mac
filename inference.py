@@ -70,7 +70,11 @@ def _fixture_to_cpu(x):
                      # stage-07 lets a Mac box replay only the FDG -> mesh
                      # + cleanup steps on CUDA's exact inputs.
                      "fdg_coords", "fdg_dual_vertices",
-                     "fdg_intersected", "fdg_split_weight"):
+                     "fdg_intersected", "fdg_split_weight",
+                     # Raw mid-decoder features (pre-sigmoid / pre-`>0` /
+                     # pre-softplus) — for isolating FDG-VAE-decoder
+                     # divergence from threshold-flip divergence.
+                     "fdg_h_feats"):
             if hasattr(x, attr):
                 v = getattr(x, attr)
                 if v is not None:
@@ -148,6 +152,46 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     print(f"[fixture] pipeline stage hooks installed -> {fixture_dir}",
           flush=True)
 
+    # --- DINOv3 image-conditioning model dumps ----------------------------
+    # The pipeline has four separate DinoV3ProjFeatureExtractor instances —
+    # one per DiT stage (sparse-structure / shape-LR / shape-HR / texture).
+    # Each is called with the preprocessed image and returns a
+    # (z_global, z_proj) tuple that conditions the corresponding DiT.
+    # Capture each instance's output via forward hook so we can A/B the
+    # DiT conditioning between MPS and CUDA at the source.
+    image_cond_models = (
+        ("01a_image_cond_ss",          "image_cond_model_ss"),
+        ("01b_image_cond_shape_512",   "image_cond_model_shape_512"),
+        ("01c_image_cond_shape_1024",  "image_cond_model_shape_1024"),
+        ("01d_image_cond_tex_1024",    "image_cond_model_tex_1024"),
+    )
+    image_cond_counter: dict[str, int] = {name: 0 for name, _ in image_cond_models}
+
+    def make_image_cond_hook(name):
+        def _hook(module, module_args, output):
+            idx = image_cond_counter[name]
+            image_cond_counter[name] += 1
+            tag = name if idx == 0 else f"{name}_call{idx}"
+            payload = output
+            if isinstance(output, tuple):
+                payload = {"z_global": output[0], "z_proj": output[1]} \
+                    if len(output) == 2 else {f"out_{i}": v for i, v in enumerate(output)}
+            _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+        return _hook
+
+    image_cond_installed = 0
+    for fname, attr in image_cond_models:
+        model = getattr(pipeline, attr, None)
+        if model is None or not callable(model):
+            continue
+        try:
+            model.register_forward_hook(make_image_cond_hook(fname))
+            image_cond_installed += 1
+        except Exception as exc:
+            print(f"[fixture] WARN: cannot hook {attr}: {exc}", flush=True)
+    print(f"[fixture] image_cond_model hooks installed ({image_cond_installed}/4)",
+          flush=True)
+
     # --- per-step sampler dumps -------------------------------------------
     # Monkey-patch FlowEulerSampler.sample (the base method that the CFG and
     # GuidanceInterval subclasses delegate to via super().sample(...)) so we
@@ -185,11 +229,25 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     @functools.wraps(original_sample)
     def patched_sample(self, *args, **kwargs):
         desc = kwargs.get("tqdm_desc", "Sampling")
+        # Snapshot RNG state BEFORE original_sample runs so we can verify
+        # that two boxes (CUDA, MPS) started each sampler call with the same
+        # entropy.  Per-step pred_x_t already exposes RNG drift indirectly;
+        # this just makes the smoking gun explicit.
+        rng_snapshot = {
+            "cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            try:
+                rng_snapshot["cuda_all"] = torch.cuda.get_rng_state_all()
+            except Exception as exc:
+                rng_snapshot["cuda_all_err"] = repr(exc)
         result = original_sample(self, *args, **kwargs)
         tag = _tag_from_desc(desc)
         idx = sampler_call_counter.get(tag, 0)
         sampler_call_counter[tag] = idx + 1
         call_suffix = "" if idx == 0 else f"_call{idx}"
+        _dump_fixture(f"{tag}{call_suffix}_rng_state", rng_snapshot,
+                      fixture_dir=fixture_dir)
         try:
             pred_x_t = list(result.pred_x_t) if hasattr(result, "pred_x_t") else []
             pred_x_0 = list(result.pred_x_0) if hasattr(result, "pred_x_0") else []
