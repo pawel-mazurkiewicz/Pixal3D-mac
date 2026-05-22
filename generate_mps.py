@@ -540,6 +540,150 @@ def init_pipeline(model_path: str, device: torch.device):
                 setattr(pipeline, method_name, _make_wrapper(original, arg_pos))
                 print(f"  -> wrapped pipeline.{method_name}(arg[{arg_pos}]) to upcast input feats to fp32")
 
+    # PIXAL3D_CPU_MODELS=<comma-list> forces named submodels to run on CPU
+    # while the rest of the pipeline stays on MPS.  Buys numerical
+    # determinism for the targeted submodel at the cost of MPS<->CPU
+    # tensor shuffling.  Use case: testing whether a model's MPS
+    # numerical drift (separate from bf16 precision) is the source of
+    # output divergence vs the CUDA reference.  Common targets:
+    #   tex_slat_decoder   — session-5 finding showed channels 3/4 (PBR
+    #                        roughness/metallic) max-abs Δ 1.21 vs CUDA;
+    #                        much larger than fp32 alone explains.
+    #   shape_slat_decoder — secondary suspect for geometry drift.
+    cpu_models_env = os.environ.get("PIXAL3D_CPU_MODELS", "").strip()
+    if cpu_models_env:
+        names = [n.strip() for n in cpu_models_env.split(",") if n.strip()]
+        print(f"[CPU] PIXAL3D_CPU_MODELS={names} — moving selected submodels to CPU.")
+        import functools as _ft2
+
+        def _to_device(obj, device):
+            """Recursively move tensors and SparseTensors to ``device``.
+
+            For pixal3d SparseTensor, also drains the ``_spatial_cache``
+            so spatial-conv neighbor tables get rebuilt on the new device
+            (otherwise sparse_conv3d_forward gets feats on cpu but cached
+            ``src_idx``/``tgt_idx``/``kernel_idx`` still on mps).
+            """
+            if torch.is_tensor(obj):
+                return obj.to(device)
+            if isinstance(obj, list):
+                return [_to_device(x, device) for x in obj]
+            if isinstance(obj, tuple):
+                return tuple(_to_device(x, device) for x in obj)
+            if isinstance(obj, dict):
+                return {k: _to_device(v, device) for k, v in obj.items()}
+            # SparseTensor: has a .data dict with tensor entries.
+            moved_sparse = False
+            if hasattr(obj, "data") and isinstance(obj.data, dict):
+                new_data = {}
+                for k, v in obj.data.items():
+                    if torch.is_tensor(v):
+                        new_data[k] = v.to(device)
+                    else:
+                        new_data[k] = v
+                obj.data = new_data
+                moved_sparse = True
+            # Also walk direct coords/feats attributes (some SparseTensor
+            # versions don't store via .data dict).
+            for attr in ("coords", "feats"):
+                if hasattr(obj, attr):
+                    cur = getattr(obj, attr)
+                    if torch.is_tensor(cur) and cur.device != torch.device(device):
+                        try:
+                            setattr(obj, attr, cur.to(device))
+                            moved_sparse = True
+                        except Exception:
+                            pass
+            # Drain spatial cache: device-specific neighbor tables become
+            # stale once we move the SparseTensor.  Cleanest fix is to
+            # let them get recomputed lazily on the new device.
+            if hasattr(obj, "_spatial_cache") and isinstance(obj._spatial_cache, dict):
+                if obj._spatial_cache:
+                    obj._spatial_cache = {}
+            if moved_sparse:
+                return obj
+            # Last resort: try .to() if available.
+            if hasattr(obj, "to") and callable(obj.to):
+                try:
+                    return obj.to(device)
+                except Exception:
+                    pass
+            return obj
+
+        cpu_call_sites = {
+            "tex_slat_decoder": [("decode_tex_slat", [0, 1])],
+            "shape_slat_decoder": [("decode_shape_slat", [0])],
+        }
+
+        # Strategy: patch the submodel's forward() directly.  Pipeline-level
+        # wrapping kept losing the race vs pipeline.to(device); forward-level
+        # patching is the inescapable hook.
+        import types as _types
+        target_device = device
+
+        def _force_cpu(m):
+            """Force every parameter and buffer in ``m`` onto CPU, in place."""
+            n_moved = 0
+            for n, p in m.named_parameters():
+                if p.device.type != "cpu":
+                    p.data = p.data.cpu()
+                    n_moved += 1
+            for n, b in m.named_buffers():
+                if b.device.type != "cpu":
+                    new = b.cpu()
+                    # set in place if possible
+                    if hasattr(b, "data"):
+                        b.data = new
+                    else:
+                        # named_buffers doesn't tell us the parent; reassign via the dict
+                        pass
+                    n_moved += 1
+            return n_moved
+
+        for name in names:
+            sub = pipeline.models.get(name) if pipeline.models else None
+            if sub is None:
+                print(f"  WARN: {name!r} not in pipeline.models; skipping.")
+                continue
+            try:
+                before_dev = next(sub.parameters()).device
+            except StopIteration:
+                print(f"  {name}: no parameters; skipping.")
+                continue
+            n_moved = _force_cpu(sub)
+            after_dev = next(sub.parameters()).device
+            print(f"  {name}: device {before_dev} -> {after_dev} ({n_moved} tensors moved)")
+
+            # Sanity probe: pick a deep parameter and confirm it's on CPU.
+            deep = list(sub.named_parameters())
+            if deep:
+                last_name, last_p = deep[-1]
+                print(f"    deep-param check: {last_name} -> {last_p.device}")
+            if hasattr(sub, "from_latent") and hasattr(sub.from_latent, "weight"):
+                print(f"    from_latent.weight.device: {sub.from_latent.weight.device}")
+
+            # Patch forward.  Capture the ORIGINAL bound forward.
+            original_forward = sub.forward
+            sub_name = name
+
+            def _make_forward_patch(orig_forward, target_out_dev, this_sub, this_name):
+                def patched_forward(*args, **kwargs):
+                    # Belt-and-suspenders: re-force CPU before each call in
+                    # case pipeline.to(device) ran between calls.
+                    moved = _force_cpu(this_sub)
+                    if moved:
+                        print(f"  [CPU forward] {this_name}: re-moved {moved} tensors to cpu before call",
+                              flush=True)
+                    # Move args/kwargs to CPU
+                    new_args = tuple(_to_device(a, torch.device("cpu")) for a in args)
+                    new_kwargs = {k: _to_device(v, torch.device("cpu")) for k, v in kwargs.items()}
+                    out = orig_forward(*new_args, **new_kwargs)
+                    return _to_device(out, target_out_dev)
+                return patched_forward
+
+            sub.forward = _make_forward_patch(original_forward, target_device, sub, sub_name)
+            print(f"  -> patched {name}.forward (CPU compute, output to {target_device})")
+
     return pipeline
 
 
@@ -870,6 +1014,14 @@ def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, f
             cmd.append("--remesh")
         if args.native_o_voxel_verbose:
             cmd.append("--verbose")
+        if args.native_debug_stages_dir:
+            debug_dir = Path(args.native_debug_stages_dir)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["--debug-stages-dir", str(debug_dir)])
+            if args.native_debug_stages_only:
+                cmd.append("--debug-stages-only")
+            if args.native_debug_raw_stages:
+                cmd.append("--debug-raw-stages")
 
         result = subprocess.run(cmd, env=_native_o_voxel_env(glb_path), check=False)
         if result.returncode != 0:
@@ -1191,6 +1343,32 @@ def parse_args():
         "--native-o-voxel-verbose",
         action="store_true",
         help="Print verbose progress from the native o_voxel subprocess.",
+    )
+    parser.add_argument(
+        "--native-debug-stages-dir",
+        type=str,
+        default=None,
+        help=(
+            "Dump the cumesh.to_glb internal substages (00_input ... "
+            "09_after_unify_orientations) as individual GLBs into this "
+            "directory.  Forwarded to o_voxel_native_export.py --debug-stages-dir."
+        ),
+    )
+    parser.add_argument(
+        "--native-debug-stages-only",
+        action="store_true",
+        help=(
+            "When used with --native-debug-stages-dir, skip the textured "
+            "GLB export and write the final geometry stage as the output."
+        ),
+    )
+    parser.add_argument(
+        "--native-debug-raw-stages",
+        action="store_true",
+        help=(
+            "When used with --native-debug-stages-dir, also dump the raw "
+            "00_input + 01_after_fill_holes stages before any simplification."
+        ),
     )
     parser.add_argument(
         "--uv-unwrap",

@@ -103,6 +103,27 @@ def repair_non_manifold_edges(
         print(f"[repair] V={V:,} F={F:,} edges={edges.shape[0]:,} "
               f"(boundary={n_boundary:,} manifold={n_manifold_edges:,} "
               f"non-manifold={n_nonman:,})")
+        if n_nonman:
+            nme_mult = edge2face_cnt[edge2face_cnt > 2]
+            mult_max = int(nme_mult.max())
+            buckets = []
+            for k in range(3, min(mult_max, 8) + 1):
+                c = int((nme_mult == k).sum())
+                if c:
+                    buckets.append(f"{k}f={c:,}")
+            if mult_max > 8:
+                c8p = int((nme_mult > 8).sum())
+                buckets.append(f"9+f={c8p:,}")
+            print(f"[repair] NME multiplicity: " + " ".join(buckets) +
+                  f" (max={mult_max})")
+        deg = np.bincount(faces.reshape(-1).astype(np.int64), minlength=V)
+        deg_nonzero = deg[deg > 0]
+        if deg_nonzero.size:
+            print(f"[repair] input vertex face-degree: "
+                  f"min={int(deg_nonzero.min())} "
+                  f"median={int(np.median(deg_nonzero))} "
+                  f"max={int(deg.max())} "
+                  f"mean={float(deg.mean()):.2f}")
 
     # For each manifold edge, get the two faces that share it.  We invert
     # face_edges (F, 3) → edge_to_face_pairs.  Since edge2face_cnt[e] == 2,
@@ -197,5 +218,36 @@ def repair_non_manifold_edges(
         delta = n_new_v - V
         print(f"[repair] new V: {n_new_v:,} (was {V:,}, +{delta:,}); "
               f"F preserved at {F:,}")
+        # Vertex split-factor histogram: how many output vertices did each
+        # input vertex expand into?  fan_size>1 means the input vertex was
+        # incident to a non-manifold join and got split.
+        fan_counts = np.bincount(new_vertex_orig_id.astype(np.int64),
+                                 minlength=V)
+        used_fans = fan_counts[fan_counts > 0]
+        n_unchanged = int((used_fans == 1).sum())
+        n_split = int((used_fans > 1).sum())
+        max_fan = int(used_fans.max()) if used_fans.size else 0
+        fan_buckets = []
+        for k in range(2, min(max_fan, 8) + 1):
+            c = int((used_fans == k).sum())
+            if c:
+                fan_buckets.append(f"x{k}={c:,}")
+        if max_fan > 8:
+            c8p = int((used_fans > 8).sum())
+            fan_buckets.append(f"x9+={c8p:,}")
+        print(f"[repair] split factors: unchanged={n_unchanged:,} "
+              f"split={n_split:,} max_fan={max_fan} "
+              + (("(" + " ".join(fan_buckets) + ")") if fan_buckets else ""))
+        post_edges, post_e2fc, _ = _build_edges(new_faces)
+        post_boundary = int((post_e2fc == 1).sum())
+        post_manifold = int((post_e2fc == 2).sum())
+        post_nme = int((post_e2fc > 2).sum())
+        print(f"[repair] post edges={post_edges.shape[0]:,} "
+              f"(boundary={post_boundary:,} "
+              f"manifold={post_manifold:,} "
+              f"non-manifold={post_nme:,})")
+        d_boundary = post_boundary - n_boundary
+        print(f"[repair] boundary edge delta: "
+              f"{n_boundary:,} -> {post_boundary:,} ({d_boundary:+,})")
 
     return new_vertices.astype(vertices.dtype), new_faces

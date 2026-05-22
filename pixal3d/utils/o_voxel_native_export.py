@@ -318,7 +318,8 @@ def _patch_repair_non_manifold_edges(postprocess_module) -> None:
 
         before_v = verts_np.shape[0]
         before_f = faces_np.shape[0]
-        new_verts_np, new_faces_np = cpu_repair(verts_np, faces_np, verbose=False)
+        repair_verbose = os.environ.get("PIXAL3D_REPAIR_VERBOSE", "0") not in ("0", "", "false", "False")
+        new_verts_np, new_faces_np = cpu_repair(verts_np, faces_np, verbose=repair_verbose)
         after_v = new_verts_np.shape[0]
         after_f = new_faces_np.shape[0]
         print(
@@ -438,6 +439,86 @@ def _patch_remove_small_connected_components(postprocess_module) -> None:
     MeshBackend._remove_small_cc_patched = True
     print(f"[o_voxel-native] _MeshBackend.remove_small_connected_components "
           f"patched (PIXAL3D_SMALL_CC={custom_min_area:.1e})", flush=True)
+
+
+
+def _patch_unify_face_orientations(postprocess_module) -> None:
+    """Replace the Metal ``unify_face_orientations`` with the CUDA-faithful CPU port.
+
+    Direct evidence the Metal implementation is broken: after it runs as
+    stage 09 of the to_glb cleanup chain, the bandaid
+    ``_per_face_winding_fix`` (in this file) still finds ~9k conflicting
+    manifold edges and flips ~1k more faces in its 8 iterations.  A
+    correct ``unify_face_orientations`` should leave ZERO conflicts on a
+    consistently-orientable mesh (and just one undecided parity per
+    Möbius-strip CC, of which there are usually none).
+
+    Inverted faces caused by this Metal bug present as "missing surface"
+    holes under backface culling, which we observe as chunks ripped out
+    of the model's front in the textured GLB output even when the input
+    mesh from CUDA stage 07 is geometrically intact.
+
+    The CPU port at ``cumesh_port.unify.unify_face_orientations`` is a
+    faithful translation of ``CuMesh::unify_face_orientations`` in
+    ``CuMesh/src/clean_up.cu:1191``: manifold-edge graph + per-edge
+    flip-flag + per-CC parity via BFS.
+
+    Enabled by default (always patches when imported); opt out by setting
+    ``PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal`` to keep the buggy Metal
+    binary in place (useful for A/B comparisons).
+    """
+    MeshBackend = getattr(postprocess_module, "_MeshBackend", None)
+    if MeshBackend is None or getattr(MeshBackend, "_unify_patched", False):
+        return
+
+    if os.environ.get("PIXAL3D_UNIFY_FACE_ORIENTATIONS", "").strip().lower() == "metal":
+        print("[o_voxel-native] PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal; "
+              "keeping native Metal unify_face_orientations (buggy)",
+              flush=True)
+        return
+
+    try:
+        unify_mod = _load_cumesh_port_module("unify.py")
+    except Exception as exc:
+        print(
+            f"[o_voxel-native] CPU cumesh_port.unify unavailable ({exc}); "
+            "falling back to native Metal unify_face_orientations (will "
+            "leave inverted faces, expect missing-surface artifacts)",
+            flush=True,
+        )
+        return
+
+    cpu_unify = unify_mod.unify_face_orientations
+
+    def _patched_unify(self):
+        import torch
+
+        verts_t, faces_t = self.read()
+        verts_np = verts_t.detach().cpu().numpy()
+        faces_np = faces_t.detach().cpu().numpy().astype(np.int64)
+        unify_verbose = os.environ.get(
+            "PIXAL3D_UNIFY_VERBOSE", "0"
+        ) not in ("0", "", "false", "False")
+        new_faces_np = cpu_unify(verts_np, faces_np, verbose=unify_verbose)
+        n_flipped = int((new_faces_np != faces_np).any(axis=1).sum())
+        print(
+            f"[o_voxel-native] cpu unify_face_orientations: "
+            f"V={verts_np.shape[0]:,} F={faces_np.shape[0]:,} "
+            f"flipped {n_flipped:,} faces "
+            f"({100.0 * n_flipped / max(1, faces_np.shape[0]):.2f}%)",
+            flush=True,
+        )
+        faces_dtype = faces_t.detach().cpu().numpy().dtype
+        faces_out = torch.from_numpy(new_faces_np.astype(faces_dtype)).to(faces_t.device)
+        # Vertices unchanged; only faces.  init() expects both, so feed
+        # the original verts tensor straight through.
+        self.init(verts_t, faces_out)
+
+    MeshBackend.unify_face_orientations = _patched_unify
+    MeshBackend._unify_patched = True
+    print("[o_voxel-native] _MeshBackend.unify_face_orientations patched to "
+          "cumesh_port.unify.unify_face_orientations",
+          flush=True)
 
 
 
@@ -752,6 +833,7 @@ def main() -> int:
     _patch_remove_small_connected_components(postprocess)  # opt-in via PIXAL3D_SMALL_CC
     _patch_simplify(postprocess)
     _patch_fill_holes(postprocess)  # opt-in via PIXAL3D_FILL_HOLES_PERIMETER
+    _patch_unify_face_orientations(postprocess)  # default on; opt out via PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal
 
     vertices, faces, attrs, coords, aabb, resolution = _load_npz(Path(args.input))
     if args.verbose:
