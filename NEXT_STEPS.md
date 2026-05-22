@@ -1,17 +1,145 @@
 # Next Steps — pamo Mac/MPS Port
 
-Captured directions to pick from for future sessions.  Ordered by likely
-ROI as of session 2026-05-21 (post divergence-hunt + downstream
-investigation).
+Captured directions to pick from for future sessions.
 
-## In-flight / ordered next
+> **Session 6 update (2026-05-22):** items #1 (tex-VAE precision) and #2
+> (FDG NME pre-clean) below are now **empirically RULED OUT** —
+> apples-to-apples diffs with `PIXAL3D_CPU_MODELS` proved both VAEs are
+> bit-identical CPU↔MPS, and downstream cleanup tuning is at its floor.
+> All visible-quality divergence localizes to the DiT samplers, dominated
+> by the `flash_attn` (CUDA reference) vs `sdpa` (Mac fallback) attention
+> backend mismatch.  See `OVERNIGHT_FINDINGS.md` and commit `d3e2c5c`.
+>
+> The original session-2 ordering is preserved below for history; do not
+> work items #1 or #2 without new evidence.
 
-1. **Texture-VAE precision focus** (next)
-2. **Pre-clean FDG NMEs before pamo runs**
+## In-flight / ordered next (post-session-7)
+
+> **Session 7 closing (2026-05-22):** Six findings, ordered by leverage:
+>
+> 1. **`metal-flash-attention` integration is RETIRED.**  Two independent
+>    signals: (a) synthetic-Q/K/V experiment showed MPS sdpa is at fp32
+>    precision floor (~1e-6 relative drift vs fp64 truth) — attention
+>    isn't the bottleneck; (b) a community MLX-native port of Pixal3D
+>    (`/Users/pawelma/code/ai/pixal3d-mlx`) using stock MLX SDPA
+>    produces visibly *worse* output than ours.  Framework switch
+>    doesn't help.
+> 2. **Pedro's `mtlmesh` port is FAITHFUL to CUDA cumesh.**  Opus-grade
+>    audit of `simplify.metal` vs `simplify.cu` (session-7) refuted the
+>    earlier "missing winding-flip-reject" diagnosis — the check IS
+>    there at `simplify.metal:56`, verbatim.  The earlier patch logic
+>    that swapped to pamo was based on a misdiagnosis.
+> 3. **`PIXAL3D_SIMPLIFY=metal` is a 50% wall-clock win** (24:55 →
+>    12:19) with equivalent quality on `1_img.png` seed=42.  Pamo's
+>    13:25 of post-processing becomes ~30s native Metal.
+>    Added `PIXAL3D_REPAIR_NME=metal` opt-out; setting both + the
+>    already-existing `PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal` produces
+>    the same wall-clock and same quality as simplify=metal alone (the
+>    speed all came from simplify; the other patches were near-zero
+>    cost).
+> 4. **The real geometry bug is a SIEVE, not a simplify-cost-function
+>    failure.**  Inside-out Blender shots show CUDA produces a sealed
+>    shell, all Mac variants (pamo, simplify=metal, full Metal chain)
+>    produce a sieve with thousands of small surface holes.  The
+>    "jagged edges / missing triangles / shards" we've been chasing
+>    are the OUTSIDE view of those same holes.
+> 5. **Two precise suspects** for the sieve, decisive test pending:
+>    (a) `pixal3d/utils/mesh_extract.py` CPU fallback (`flexible_dual_grid_to_mesh`)
+>    leaving missing-face chunks vs CUDA's o_voxel extraction;
+>    (b) Mac cleanup chain destroying good input.  Both could be
+>    contributors; precise test is to load CUDA's pre-extracted stage-08
+>    mesh and run only the cleanup chain on Mac.
+> 6. **Texture fuzz** is independent of the sieve.  Separate hunt:
+>    bilinear sampling boundary handling, fp16/fp32 accumulators in
+>    DINOv3+NAF, texture bake step.  Don't conflate with geometry.
+
+1. **Decisive sieve test: load CUDA stage-08 mesh, run only Mac
+   cleanup chain.**  We have `fixtures/cuda/08_to_glb_geometry.pt`
+   (402MB).  Convert to the `.npz` format expected by
+   `generate_mps.py --load-mesh` (keys: vertices, faces, coords,
+   attrs, origin, voxel_size, resolution + optional fdg_*) and run
+   the cleanup-and-bake path.  Outcome split:
+     - Result **sealed** → bug is in Mac mesh extraction
+       (`pixal3d/utils/mesh_extract.py`).  Next: audit CPU
+       `flexible_dual_grid_to_mesh` for missing edge cases.
+     - Result **sieve** → bug is in Mac cleanup chain regardless of
+       input quality.  Next: bisect the chain stages on the same
+       pre-extracted CUDA mesh.
+2. **Investigate the coord-convention smoking gun.**  CUDA bbox is
+   long-axis-Y (~0.69 × 0.88 × 0.62), all our Mac outputs are
+   long-axis-Z (~0.69 × 0.60 × 0.88).  Shared between two independent
+   Mac ports → lives upstream of both.  Cosmetic per user (textures
+   align correctly on the rotated mesh) but worth a one-line fix once
+   we find where.
+3. **Texture-quality investigation (separate from geometry).**  Per
+   pixal3d-mlx PLAN.md's Phase 7: bilinear sampling differences,
+   fp16/fp32 accumulators in DINOv3 + NAF upsampler, texture bake.
+4. **Always-on `PIXAL3D_CPU_MODELS=sparse_structure_flow_model,sparse_structure_decoder`**
+   as a free incremental quality win (+~1 min wall, +0.1pp stage-02
+   coord agreement).  Marginal but free.  Promote once regression-tested.
+
+## Suspect lists (split by symptom)
+
+### Geometry sieve (high-priority — addresses the dominant remaining gap)
+
+- **CPU `flexible_dual_grid_to_mesh` in `pixal3d/utils/mesh_extract.py`** —
+  may be missing edge cases the CUDA o_voxel extraction handles.  The
+  904K NMEs in our FDG output could be a symptom of this.  Decisive
+  test: stage-08 replay (see #1 in ordered list).
+- **Cleanup chain destroying good input** — `mps_replay_cuda07` showed
+  destruction even with CUDA's clean SLat output, but that replay still
+  ran our Mac extraction.  Stage-08 replay isolates this.
+- **`fill_holes` default perimeter too tight** — 3cm default leaves
+  ~50K medium holes (5–30 cm range) per the session-3 Blender audit.
+  Tune via `PIXAL3D_FILL_HOLES_PERIMETER`.  But this is a *symptom
+  patch* on top of a deeper bug, not the bug itself.
+
+### Texture fuzz (separate hunt — not relevant until geometry is fixed)
+
+Per pixal3d-mlx PLAN.md's Phase 7 expected culprits:
+
+- **Bilinear sampling boundary handling** in DINOv2 back-projection /
+  voxel-to-pixel sampling.  CUDA / MPS / MLX all differ subtly.
+- **fp16 vs fp32 accumulators** in conditioning models (DINOv3, NAF
+  upsampler).
+- **Camera coord conventions** — also explains the cosmetic Z-vs-Y
+  long-axis rotation (see ordered #2).
+
+## Retired (do not work)
+
+- ~~Texture-VAE precision focus~~ (session 6 — VAEs proven deterministic).
+- ~~Pre-clean FDG NMEs before pamo~~ (session 6 — cleanup is at its floor).
+- ~~`philipturner/metal-flash-attention` integration~~ (session 7 — attention
+  is at fp32 floor; not the bottleneck).
+- ~~Switch to MLX-native port~~ (session 7 — produces visibly worse output
+  than our PyTorch/MPS port).
+- ~~Replace pamo as a *quality* fix~~ (session 7 — pamo and Pedro's Metal
+  port produce the same sieve.  `PIXAL3D_SIMPLIFY=metal` is a 50% wall-clock
+  win but does NOT close the geometry gap.  Sieve is upstream).
+- ~~Sparse conv / `flex_gemm` divergence~~ (session 7 — MLX port author
+  tried `flex_gemm_sparse_attn` and got no quality change.  Not the cause).
+
+## Parked (low priority)
+
+- Finish the SparseTensor device-mismatch bug in the `PIXAL3D_CPU_MODELS`
+  wrapper so it works for `ElasticSLatFlowModel` too.  Only needed if we
+  want the all-DiTs-on-CPU experimental baseline finished.
+
+## Historical ordering (pre-session-6, kept for context)
+
+1. **Texture-VAE precision focus** — [RULED OUT — session 6]
+2. **Pre-clean FDG NMEs before pamo runs** — [RULED OUT — session 6]
 
 ## All candidate directions
 
-### 1. Texture-VAE precision focus  *(next)*
+### 1. Texture-VAE precision focus  *(next)*  **[RULED OUT — session 6]**
+
+> Session 6 proved both VAEs (`shape_slat_decoder`, `tex_slat_decoder`)
+> are 100% deterministic — bit-identical output on CPU vs MPS for the
+> same SparseTensor input.  The muted-texture symptom is therefore not
+> a tex-VAE precision issue; it's the upstream DiT drift exposing
+> different SparseTensor coords to the decoder.  Do NOT spend time
+> here.
 
 The "muted/blurry texture" half of the visible quality gap is currently
 completely unaddressed.
@@ -29,7 +157,14 @@ completely unaddressed.
 
 Effort: ~half day.  Payoff: potentially high — fixes the texture half.
 
-### 2. Pre-clean FDG NMEs before pamo runs
+### 2. Pre-clean FDG NMEs before pamo runs  **[RULED OUT — session 6]**
+
+> Session 6 confirmed the downstream cleanup chain is at its empirical
+> floor: the geometry damage comes from the MPS DiT samplers producing
+> fundamentally different SparseTensor coords than CUDA, not from
+> repair_nme / small_cc / fill_holes mishandling NME-heavy input.
+> Pre-cleaning NMEs would only attack a symptom.  Do NOT spend time
+> here.
 
 Attack the root cause of the geometry damage chain.
 

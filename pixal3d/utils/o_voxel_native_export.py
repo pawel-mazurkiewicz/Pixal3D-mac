@@ -297,6 +297,22 @@ def _patch_repair_non_manifold_edges(postprocess_module) -> None:
     if MeshBackend is None or getattr(MeshBackend, "_repair_nme_patched", False):
         return
 
+    # Session 7: PIXAL3D_REPAIR_NME=metal opts into Pedro's mtlmesh
+    # repair_non_manifold_edges.  The previous diagnosis (Metal over-splits
+    # ~3x) was empirically supported but may be a symptom of pamo's bad
+    # collapses producing extra NMEs in the first place.  With Metal
+    # simplify producing far fewer NMEs (session-7 observation: +19K
+    # inflation instead of +2.5M), it's worth testing the native Metal
+    # repair as well.  Default remains CPU port for safe rollback.
+    if os.environ.get("PIXAL3D_REPAIR_NME", "").strip().lower() == "metal":
+        print(
+            "[o_voxel-native] PIXAL3D_REPAIR_NME=metal — keeping native "
+            "cumesh.CuMesh.repair_non_manifold_edges (mtlmesh)",
+            flush=True,
+        )
+        MeshBackend._repair_nme_patched = True  # idempotent across calls
+        return
+
     try:
         repair_mod = _load_cumesh_port_module("repair.py")
     except Exception as exc:
@@ -639,6 +655,29 @@ def _patch_simplify(postprocess_module) -> None:
     MeshBackend = getattr(postprocess_module, "_MeshBackend", None)
     if MeshBackend is None or getattr(MeshBackend, "_simplify_patched", False):
         return
+
+    # Session 7: PIXAL3D_SIMPLIFY=metal opts into Pedro's mtlmesh Metal port
+    # (JIT-compiled from src/metal/simplify.metal).  The session-7 audit
+    # confirmed simplify.metal:56 carries the winding-flip-reject check
+    # faithfully from CUDA simplify.cu:127-129, refuting the earlier
+    # "Metal port skips the check" diagnosis that motivated this pamo patch.
+    # Default remains pamo for safe rollback; flip default after validation.
+    backend = os.environ.get("PIXAL3D_SIMPLIFY", "pamo").lower()
+    if backend == "metal":
+        print(
+            "[o_voxel-native] PIXAL3D_SIMPLIFY=metal — keeping native "
+            "cumesh.CuMesh.simplify (mtlmesh JIT-compiled from simplify.metal; "
+            "session-7 audit confirmed faithful to CUDA simplify.cu)",
+            flush=True,
+        )
+        MeshBackend._simplify_patched = True  # idempotent across multiple calls
+        return
+    if backend != "pamo":
+        print(
+            f"[o_voxel-native] PIXAL3D_SIMPLIFY={backend!r} unknown; "
+            "defaulting to pamo",
+            flush=True,
+        )
 
     try:
         pamo_mod = _load_pamo_simplify_module()

@@ -886,3 +886,145 @@ Per `NEXT_STEPS.md` (this session's planning doc, ordered by ROI):
   `--save-mesh` for bake/UV/cleanup tuning, `--load-fixture-07` for
   post-pipeline replay.  Future debug runs should ideally chain all
   three so we don't pay the ~30 min cost twice.
+
+
+## Session 7 — 2026-05-22 — sieve diagnosis + mtlmesh integration
+
+### Headline
+
+The geometry-quality bug is a **SIEVE** (thousands of small surface
+holes) — not a simplify cost-function failure as previously hypothesized.
+Inside-out Blender shots show CUDA produces a sealed shell, all Mac
+variants (pamo, mtlmesh-simplify, full Pedro Metal chain) produce a
+sieve.  Two precise suspects remain, decisively testable.
+
+### Chronology
+
+1. **Picked up handoff from session 6** (commit `d3e2c5c`).  Prior
+   diagnosis: divergence in DiT samplers, attributed to flash_attn vs
+   sdpa attention reduction-order drift compounding through samplers.
+   Recommended path: port `philipturner/metal-flash-attention`.
+
+2. **Ruled out metal-flash-attention as the answer.**  Synthetic
+   Q/K/V probe (`scratch/probe_mlx_vs_sdpa_attention.py`) measured
+   MPS sdpa drift at ~1e-6 relative vs fp64 truth — the fp32
+   precision floor.  Per-op attention drift can't credibly compound
+   to 3.06 mean-abs feature diff from a 1e-6 floor.  Attention is
+   not the bottleneck.
+
+3. **Found three Pedro forks not on disk before**: `mtlmesh` (Metal
+   cumesh), `mtlgemm` (Metal GEMM), `mtlbvh` (Metal BVH).  Also found
+   `pixal3d-mlx` (community MLX-native port of Pixal3D, 8 commits ahead
+   of upstream, cites our `feat/apple-silicon-port` branch as a
+   precursor).
+
+4. **Ran pixal3d-mlx end-to-end on `1_img.png` seed=42** for
+   apples-to-apples comparison.  Result: MLX port produces visibly
+   *worse* output than our PyTorch/MPS port (more artifacts, worse
+   textures, regressed transparency-by-camera-angle bug we already
+   fixed via session-6 unify port).  Framework switch is not the
+   answer.
+
+5. **User flagged the showcase-mesh vs our-CUDA-reference distinction.**
+   The published Pixal3D website mesh has details (window muntins, etc)
+   that our own CUDA A4000 run does not.  Quality-ceiling gap (likely
+   `1536_cascade` vs our `1024_cascade`), separate from Mac-vs-CUDA
+   divergence.  Re-anchored comparisons.
+
+6. **Audited `mtlmesh/src/metal/simplify.metal` vs
+   `CuMesh/src/simplify.cu`** (subagent, opus).  Verdict
+   ADOPT-AS-IS: Pedro's port is a faithful mechanical translation of
+   CUDA.  The previously-flagged "missing winding-flip-reject at
+   `simplify.cu:128`" was a misdiagnosis — the check is present at
+   `simplify.metal:56` verbatim.
+
+7. **Integrated mtlmesh into Pixal3D venv.**
+   - Installed Metal Toolchain (macOS 26 separated it from Xcode).
+   - Cloned and `pip install --no-build-isolation` of mtlmesh,
+     mtlbvh, mtlgemm.
+   - Added `PIXAL3D_SIMPLIFY=metal` env opt-out to `_patch_simplify`
+     in `o_voxel_native_export.py`.  Default remains `pamo` for safe
+     rollback.
+
+8. **Ran with `PIXAL3D_SIMPLIFY=metal`** on `1_img.png` seed=42.
+   Result: wall time 24:55 → 12:19 (50% faster, pamo's 13:25
+   post-pipeline became ~30s native Metal).  repair_nme vertex
+   inflation dropped from +2.5M to +19K (Metal simplify produces a
+   near-manifold mesh; repair_nme has almost nothing to do).
+   Quality: visually equivalent — not better, not worse.  Same shards
+   and artifact density as pamo.
+
+9. **Added `PIXAL3D_REPAIR_NME=metal` env opt-out**, ran full Metal
+   chain (`PIXAL3D_SIMPLIFY=metal PIXAL3D_REPAIR_NME=metal
+   PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal`).  Same wall time, same
+   quality.  The other patches were near-zero cost — all the speedup
+   came from simplify.
+
+10. **User's inside-out Blender shots revealed the sieve.**  CUDA
+    shell from inside: sealed, smooth walls.  All Mac variants from
+    inside: thousands of small holes (orange Blender hole-boundary
+    outlines).  This is the dominant geometry bug; the visible
+    "jagged edges / missing triangles" we'd been chasing are the
+    outside view of the sieve.
+
+### Files added/changed (committable)
+
+- `pixal3d/utils/o_voxel_native_export.py`:
+  - `_patch_simplify` now respects `PIXAL3D_SIMPLIFY=metal` (early
+    return, leaves native `cumesh.CuMesh.simplify` in place).
+  - `_patch_repair_non_manifold_edges` now respects
+    `PIXAL3D_REPAIR_NME=metal` (same pattern).
+  - Both default to existing CPU-port behaviour; opt-in only.
+- `NEXT_STEPS.md`:
+  - Session-7 update block reflecting end-state findings.
+  - Ordered next list reorganized around the sieve hypothesis.
+  - Suspect list split into geometry/texture symptoms.
+  - Retired list expanded.
+
+### Off-tree assets used (not committable; for next-session context)
+
+- `/Users/pawelma/code/ai/CuMesh/` — CUDA cumesh source (gold standard).
+- `/Users/pawelma/code/ai/mtlmesh/` — Pedro's Metal port (audited
+  faithful for simplify; covers full mesh chain in Metal).
+- `/Users/pawelma/code/ai/mtlbvh/` — Pedro's Metal BVH (dep of cumesh).
+- `/Users/pawelma/code/ai/mtlgemm/` — Pedro's Metal GEMM (dep of cumesh).
+- `/Users/pawelma/code/ai/pixal3d-mlx/` — community MLX-native port,
+  Phase 7 (parity/quality) not started.  Useful as a reference for
+  alternative ports of specific components, not as a wholesale switch.
+- `/Users/pawelma/code/ai/trellis-mac/` — pedronaugusto's TRELLIS-2
+  Apple Silicon port; uses the same Metal kernel infra.
+
+### Concrete next move (start of next session)
+
+Run the **decisive sieve test**:
+
+1. Write a one-shot script to convert `fixtures/cuda/08_to_glb_geometry.pt`
+   to the `.npz` format expected by `generate_mps.py --load-mesh`
+   (keys: vertices, faces, coords, attrs, origin, voxel_size,
+   resolution, optionally fdg_*).
+2. Invoke `generate_mps.py --load-mesh <converted.npz> ...` with the
+   same seed/params.  This bypasses our mesh extraction entirely.
+3. Inspect output:
+   - **Sealed** → bug is in `pixal3d/utils/mesh_extract.py` CPU
+     `flexible_dual_grid_to_mesh`.  Audit edge cases vs CUDA o_voxel.
+   - **Sieve** → bug is in Mac cleanup chain regardless of input
+     quality.  Bisect stages on the same pre-extracted CUDA mesh.
+
+### Key new heuristics
+
+- **`mx.fast.scaled_dot_product_attention` is already at the kernel-fusion
+  ceiling on M3 Ultra.**  Pedro's `flex_gemm_sparse_attn` and
+  `mx.compile` were tried by the MLX port author with negative results
+  (+14% slower and +4% slower respectively, no quality change).  Don't
+  retest.
+- **PAMO_PORT_PLAN.md's `simplify.cu:128` "missing check" diagnosis
+  was wrong.**  Pedro's port at `simplify.metal:56` has the check.
+  Whenever historical session notes flag "Metal port skips X", verify
+  against source before relying.
+- **Pamo and Pedro's Metal simplify produce the same sieve.**  The
+  geometry destruction is NOT a simplify-cost-function problem.  Any
+  future "fix simplify to close holes" work should be considered
+  retired.
+- **Texture fuzz is independent of geometry sieve.**  Don't try to
+  fix textures by fixing geometry or vice versa; they are separate
+  hunts with separate suspects.
