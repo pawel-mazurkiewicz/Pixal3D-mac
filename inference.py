@@ -93,9 +93,19 @@ def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
     If the env var PIXAL3D_STOP_AFTER is set and matches this fixture name,
     exits the process cleanly after the save — used to skip late stages
     (e.g. shape/texture VAE decode) when we only care about the early
-    pipeline."""
+    pipeline.
+
+    PIXAL3D_NATTEN_PROBE_ONLY=1 — minimal-bandwidth mode for natten parity
+    work.  Filters everything except fixtures whose name contains "_natten_"
+    so the rental run produces only the natten capture (hundreds of MB
+    instead of ~7 GB).  Combine with PIXAL3D_STOP_AFTER=01b_natten_shape_512
+    to exit immediately after the first natten capture.
+    """
     target = fixture_dir if fixture_dir is not None else PIXAL3D_DUMP_FIXTURES
     if not target:
+        return
+    if os.environ.get("PIXAL3D_NATTEN_PROBE_ONLY", "").strip() == "1" \
+            and "_natten_" not in name:
         return
     os.makedirs(target, exist_ok=True)
     out = os.path.join(target, f"{name}.pt")
@@ -118,8 +128,22 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     Each method may be invoked more than once per inference (e.g. the cascade
     path calls shape_slat twice).  We append `_call{N}` so fixtures from
     multiple invocations don't overwrite each other.
+
+    ``PIXAL3D_NATTEN_PROBE_ONLY=1`` — minimal-bandwidth mode for natten
+    parity work.  Skips all stage dumps, image_cond dumps, and per-step
+    sampler dumps.  Only the first natten capture (01b_natten_shape_512)
+    fires; pipeline exits immediately after via implicit
+    ``PIXAL3D_STOP_AFTER``.  Total download ~hundreds of MB instead of ~7 GB.
     """
     import functools
+
+    PROBE_ONLY = os.environ.get("PIXAL3D_NATTEN_PROBE_ONLY", "").strip() == "1"
+    if PROBE_ONLY:
+        if not os.environ.get("PIXAL3D_STOP_AFTER", "").strip():
+            os.environ["PIXAL3D_STOP_AFTER"] = "01b_natten_shape_512"
+        print(f"[fixture] PIXAL3D_NATTEN_PROBE_ONLY=1: skipping stage/"
+              f"image_cond/sampler dumps; STOP_AFTER="
+              f"{os.environ['PIXAL3D_STOP_AFTER']}", flush=True)
 
     stage_map = {
         "sample_sparse_structure":      "02_sparse_structure",
@@ -132,25 +156,26 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
 
     call_counter: dict[str, int] = {n: 0 for n in stage_map.values()}
 
-    for method_name, fixture_name in stage_map.items():
-        original = getattr(pipeline, method_name, None)
-        if original is None or not callable(original):
-            continue
+    if not PROBE_ONLY:
+        for method_name, fixture_name in stage_map.items():
+            original = getattr(pipeline, method_name, None)
+            if original is None or not callable(original):
+                continue
 
-        def make_wrapper(orig, fname):
-            @functools.wraps(orig)
-            def wrapped(*args, **kwargs):
-                result = orig(*args, **kwargs)
-                idx = call_counter[fname]
-                call_counter[fname] += 1
-                tag = fname if idx == 0 else f"{fname}_call{idx}"
-                _dump_fixture(tag, result, fixture_dir=fixture_dir)
-                return result
-            return wrapped
+            def make_wrapper(orig, fname):
+                @functools.wraps(orig)
+                def wrapped(*args, **kwargs):
+                    result = orig(*args, **kwargs)
+                    idx = call_counter[fname]
+                    call_counter[fname] += 1
+                    tag = fname if idx == 0 else f"{fname}_call{idx}"
+                    _dump_fixture(tag, result, fixture_dir=fixture_dir)
+                    return result
+                return wrapped
 
-        setattr(pipeline, method_name, make_wrapper(original, fixture_name))
-    print(f"[fixture] pipeline stage hooks installed -> {fixture_dir}",
-          flush=True)
+            setattr(pipeline, method_name, make_wrapper(original, fixture_name))
+        print(f"[fixture] pipeline stage hooks installed -> {fixture_dir}",
+              flush=True)
 
     # --- DINOv3 image-conditioning model dumps ----------------------------
     # The pipeline has four separate DinoV3ProjFeatureExtractor instances —
@@ -191,6 +216,55 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
             print(f"[fixture] WARN: cannot hook {attr}: {exc}", flush=True)
     print(f"[fixture] image_cond_model hooks installed ({image_cond_installed}/4)",
           flush=True)
+
+    # --- natten.na2d input/output capture ---------------------------------
+    # NAF (valeoai/NAF) calls natten.na2d(q, k, v, kernel_size=(9,9),
+    # dilation=..., stride=1, backend="cutlass-fna") for its CrossAttention
+    # upsampler.  natten 0.21 has NO MPS backend, and cutlass-fna is the
+    # CUDA gold reference we want to match in a future Metal port.
+    # Capture (q, k, v, kernel_size, dilation, scale, out) on every call so
+    # the Mac side can compute its candidate kernel on the SAME inputs and
+    # diff against the CUDA reference output.
+    # Three calls per pipeline run (one per NAF-bearing image_cond stage:
+    # 01b/01c/01d — 01a has use_naf_upsample=False).
+    try:
+        import natten as _natten
+        _natten_call_counter = {"n": 0}
+        _natten_call_labels = ("01b_natten_shape_512", "01c_natten_shape_1024",
+                               "01d_natten_tex_1024")
+        _orig_na2d = _natten.na2d
+
+        def _na2d_capture(query, key, value, kernel_size, *args, **kwargs):
+            n = _natten_call_counter["n"]
+            tag = _natten_call_labels[n] if n < len(_natten_call_labels) \
+                else f"natten_call{n}"
+            _natten_call_counter["n"] = n + 1
+            out = _orig_na2d(query, key, value, kernel_size, *args, **kwargs)
+            payload = {
+                "q": query.detach().cpu(),
+                "k": key.detach().cpu(),
+                "v": value.detach().cpu(),
+                "out": out.detach().cpu(),
+                "kernel_size": kernel_size,
+                "dilation": kwargs.get("dilation", args[1] if len(args) > 1 else 1),
+                "stride": kwargs.get("stride", args[0] if len(args) > 0 else 1),
+                "scale": kwargs.get("scale", None),
+                "is_causal": kwargs.get("is_causal", False),
+                "backend": kwargs.get("backend", None),
+                "shapes_str": (
+                    f"q={tuple(query.shape)} k={tuple(key.shape)} "
+                    f"v={tuple(value.shape)} out={tuple(out.shape)} "
+                    f"ks={kernel_size} dilation={kwargs.get('dilation', 1)}"
+                ),
+            }
+            _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+            return out
+
+        _natten.na2d = _na2d_capture
+        print("[fixture] natten.na2d capture wrapper installed", flush=True)
+    except Exception as exc:
+        print(f"[fixture] WARN: cannot install natten.na2d capture: {exc}",
+              flush=True)
 
     # --- per-step sampler dumps -------------------------------------------
     # Monkey-patch FlowEulerSampler.sample (the base method that the CFG and

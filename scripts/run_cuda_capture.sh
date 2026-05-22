@@ -83,6 +83,11 @@ export SPARSE_ATTN_BACKEND=sdpa
 
 export PIXAL3D_DUMP_FIXTURES="$FIXTURES"
 
+# Minimal-bandwidth probe for natten parity work.  Set this in the calling
+# env to capture ONLY the first NAF natten call (01b_natten_shape_512) and
+# exit; total download ~hundreds of MB instead of ~7 GB.
+#   PIXAL3D_NATTEN_PROBE_ONLY=1 ./scripts/run_cuda_capture.sh
+
 # --- info banner ---
 echo "============================================================"
 echo "Pixal3D CUDA capture"
