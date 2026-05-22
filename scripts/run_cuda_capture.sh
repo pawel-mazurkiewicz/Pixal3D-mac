@@ -28,6 +28,7 @@ OUTPUT=""
 SEED=42
 RESOLUTION=1024
 FIXTURES=""
+PROBE_ONLY=0   # see --probe-only / PIXAL3D_NATTEN_PROBE_ONLY
 EXTRA_ARGS=()
 
 usage() {
@@ -42,6 +43,11 @@ Required:
 Optional:
   --seed N            random seed (default: $SEED)
   --resolution N      pipeline resolution: 1024 or 1536 (default: $RESOLUTION)
+  --probe-only        natten parity capture mode: dump ONLY the first natten
+                      call (01b_natten_shape_512) and exit cleanly.  Skips
+                      stage/image_cond/sampler dumps.  Total fixture size
+                      ~hundreds of MB instead of ~7 GB.  Equivalent to
+                      setting PIXAL3D_NATTEN_PROBE_ONLY=1 externally.
   -- ...              everything after \`--\` is passed through to inference.py
                       (e.g. --fov 0.5, --low_vram for consumer GPUs)
 EOF
@@ -55,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --seed)       SEED="$2";       shift 2 ;;
         --resolution) RESOLUTION="$2"; shift 2 ;;
         --fixtures)   FIXTURES="$2";   shift 2 ;;
+        --probe-only) PROBE_ONLY=1;    shift ;;
         --)           shift; EXTRA_ARGS=("$@"); break ;;
         -h|--help)    usage; exit 0 ;;
         *)            echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -83,10 +90,16 @@ export SPARSE_ATTN_BACKEND=sdpa
 
 export PIXAL3D_DUMP_FIXTURES="$FIXTURES"
 
-# Minimal-bandwidth probe for natten parity work.  Set this in the calling
-# env to capture ONLY the first NAF natten call (01b_natten_shape_512) and
-# exit; total download ~hundreds of MB instead of ~7 GB.
-#   PIXAL3D_NATTEN_PROBE_ONLY=1 ./scripts/run_cuda_capture.sh
+# Minimal-bandwidth probe for natten parity work.  Either pass --probe-only
+# on the command line OR set PIXAL3D_NATTEN_PROBE_ONLY=1 in the env before
+# invoking this script.  Captures ONLY the first NAF natten call
+# (01b_natten_shape_512) and exits cleanly.  Total download ~hundreds of
+# MB instead of ~7 GB.
+if [[ "$PROBE_ONLY" == "1" ]]; then
+    export PIXAL3D_NATTEN_PROBE_ONLY=1
+fi
+# Resolve final probe state (either source — flag or pre-set env var).
+PROBE_ACTIVE="${PIXAL3D_NATTEN_PROBE_ONLY:-0}"
 
 # --- info banner ---
 echo "============================================================"
@@ -97,6 +110,11 @@ echo "  output      : $OUTPUT"
 echo "  seed        : $SEED"
 echo "  resolution  : $RESOLUTION"
 echo "  fixtures    : $FIXTURES"
+if [[ "$PROBE_ACTIVE" == "1" ]]; then
+    echo "  >>> NATTEN PROBE-ONLY MODE <<<  (skipping all non-natten dumps)"
+else
+    echo "  probe only  : OFF  (full ~7 GB capture; use --probe-only to filter)"
+fi
 echo "  extra args  : ${EXTRA_ARGS[*]:-(none)}"
 echo "  python      : $(command -v python)"
 echo "  torch       : $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '???')"

@@ -229,6 +229,8 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     # 01b/01c/01d — 01a has use_naf_upsample=False).
     try:
         import natten as _natten
+        import sys as _sys
+        import atexit as _atexit
         _natten_call_counter = {"n": 0}
         _natten_call_labels = ("01b_natten_shape_512", "01c_natten_shape_1024",
                                "01d_natten_tex_1024")
@@ -260,8 +262,60 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
             _dump_fixture(tag, payload, fixture_dir=fixture_dir)
             return out
 
+        # Patch the canonical top-level reference (covers callers that do
+        # `import natten; natten.na2d(...)`).
         _natten.na2d = _na2d_capture
-        print("[fixture] natten.na2d capture wrapper installed", flush=True)
+
+        # NAF (valeoai/NAF) imports the function at module-load time:
+        #   from natten import na2d                  # attentions.py:11
+        #   ...
+        #   out = na2d(q, k, v, ...)                 # attentions.py:72
+        # That binds the ORIGINAL function object into NAF's namespace
+        # before we get a chance to monkey-patch natten.na2d.  Patching
+        # only the upstream attribute therefore misses NAF's call site
+        # entirely (we observed exactly this in the first rental run:
+        # zero natten fixtures dumped despite 3 expected calls).
+        #
+        # Walk sys.modules and rebind any module-level `na2d` symbol
+        # that is identical (by object identity) to the original natten
+        # function we just replaced.  Skip natten itself (already done).
+        _patched_local = 0
+        _patched_modules = []
+        for _modname, _mod in list(_sys.modules.items()):
+            if _mod is None or _mod is _natten:
+                continue
+            try:
+                _local = getattr(_mod, "na2d", None)
+            except Exception:
+                continue
+            if _local is _orig_na2d:
+                try:
+                    setattr(_mod, "na2d", _na2d_capture)
+                    _patched_local += 1
+                    _patched_modules.append(_modname)
+                except Exception as _exc:
+                    print(f"[fixture] WARN: failed to rebind na2d in "
+                          f"{_modname}: {_exc}", flush=True)
+        print(f"[fixture] natten.na2d capture wrapper installed "
+              f"(natten.na2d + {_patched_local} local bindings: "
+              f"{_patched_modules})", flush=True)
+
+        # Loud end-of-run check: if the wrapper installed but never
+        # fired, something else bypassed both the top-level and local
+        # rebinds (e.g. NAF was lazy-imported AFTER hook install, or
+        # natten was reimported, or NAF wraps na2d in a closure we
+        # missed).  We want this to scream in the rental log.
+        def _natten_fire_check():
+            if _natten_call_counter["n"] == 0:
+                print("[fixture] !!! WARN: natten.na2d wrapper was "
+                      "installed but NEVER FIRED during this run.  "
+                      "Expected ~3 calls (one per NAF-bearing image_cond "
+                      "stage).  Check NAF's import path; the local-binding "
+                      "rebind walk may have run too early.", flush=True)
+            else:
+                print(f"[fixture] natten.na2d wrapper fired "
+                      f"{_natten_call_counter['n']} time(s).", flush=True)
+        _atexit.register(_natten_fire_check)
     except Exception as exc:
         print(f"[fixture] WARN: cannot install natten.na2d capture: {exc}",
               flush=True)
