@@ -139,11 +139,15 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
 
     PROBE_ONLY = os.environ.get("PIXAL3D_NATTEN_PROBE_ONLY", "").strip() == "1"
     if PROBE_ONLY:
-        if not os.environ.get("PIXAL3D_STOP_AFTER", "").strip():
-            os.environ["PIXAL3D_STOP_AFTER"] = "01b_natten_shape_512"
-        print(f"[fixture] PIXAL3D_NATTEN_PROBE_ONLY=1: skipping stage/"
-              f"image_cond/sampler dumps; STOP_AFTER="
-              f"{os.environ['PIXAL3D_STOP_AFTER']}", flush=True)
+        # Exit is driven by the natten capture wrappers themselves (they call
+        # os._exit(0) after the first complete attention is dumped), so we
+        # don't set STOP_AFTER here.  Earlier revisions auto-set
+        # STOP_AFTER="01b_natten_shape_512", but that label is never produced
+        # by the new sequential naming and never matched the legacy path —
+        # the pipeline ran to completion despite probe mode.
+        print("[fixture] PIXAL3D_NATTEN_PROBE_ONLY=1: skipping stage/"
+              "image_cond/sampler dumps; natten wrappers will self-exit "
+              "after the first complete attention.", flush=True)
 
     stage_map = {
         "sample_sparse_structure":      "02_sparse_structure",
@@ -227,97 +231,188 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     # diff against the CUDA reference output.
     # Three calls per pipeline run (one per NAF-bearing image_cond stage:
     # 01b/01c/01d — 01a has use_naf_upsample=False).
+    # NAF picks ONE of two natten entry points at module-import time:
+    #
+    #   try:   from natten.functional import na2d_av, na2d_qk   # legacy split
+    #          NATTEN_RECENT = False
+    #   except: from natten import na2d                          # modern fused
+    #          NATTEN_RECENT = True
+    #
+    # Which branch wins depends on the installed natten version (rental
+    # box may have natten<0.21 with the split symbols; Mac has 0.21 which
+    # dropped them).  Previous rental run showed na2d wrapper installed
+    # but never fired — confirming the rental box hit the LEGACY path.
+    #
+    # We now patch all three possible entry points and rebind any
+    # module-local copies via sys.modules.  Whichever branch NAF took,
+    # at least one wrapper will fire.
     try:
         import natten as _natten
         import sys as _sys
         import atexit as _atexit
-        _natten_call_counter = {"n": 0}
-        _natten_call_labels = ("01b_natten_shape_512", "01c_natten_shape_1024",
-                               "01d_natten_tex_1024")
-        _orig_na2d = _natten.na2d
 
-        def _na2d_capture(query, key, value, kernel_size, *args, **kwargs):
-            n = _natten_call_counter["n"]
-            tag = _natten_call_labels[n] if n < len(_natten_call_labels) \
-                else f"natten_call{n}"
-            _natten_call_counter["n"] = n + 1
-            out = _orig_na2d(query, key, value, kernel_size, *args, **kwargs)
-            payload = {
-                "q": query.detach().cpu(),
-                "k": key.detach().cpu(),
-                "v": value.detach().cpu(),
-                "out": out.detach().cpu(),
-                "kernel_size": kernel_size,
-                "dilation": kwargs.get("dilation", args[1] if len(args) > 1 else 1),
-                "stride": kwargs.get("stride", args[0] if len(args) > 0 else 1),
-                "scale": kwargs.get("scale", None),
-                "is_causal": kwargs.get("is_causal", False),
-                "backend": kwargs.get("backend", None),
-                "shapes_str": (
-                    f"q={tuple(query.shape)} k={tuple(key.shape)} "
-                    f"v={tuple(value.shape)} out={tuple(out.shape)} "
-                    f"ks={kernel_size} dilation={kwargs.get('dilation', 1)}"
-                ),
-            }
-            _dump_fixture(tag, payload, fixture_dir=fixture_dir)
-            return out
+        _na2d_n     = {"n": 0}
+        _na2d_qk_n  = {"n": 0}
+        _na2d_av_n  = {"n": 0}
 
-        # Patch the canonical top-level reference (covers callers that do
-        # `import natten; natten.na2d(...)`).
-        _natten.na2d = _na2d_capture
+        _PROBE_EXIT_AFTER_FIRST = PROBE_ONLY  # captured from outer scope
 
-        # NAF (valeoai/NAF) imports the function at module-load time:
-        #   from natten import na2d                  # attentions.py:11
-        #   ...
-        #   out = na2d(q, k, v, ...)                 # attentions.py:72
-        # That binds the ORIGINAL function object into NAF's namespace
-        # before we get a chance to monkey-patch natten.na2d.  Patching
-        # only the upstream attribute therefore misses NAF's call site
-        # entirely (we observed exactly this in the first rental run:
-        # zero natten fixtures dumped despite 3 expected calls).
-        #
-        # Walk sys.modules and rebind any module-level `na2d` symbol
-        # that is identical (by object identity) to the original natten
-        # function we just replaced.  Skip natten itself (already done).
-        _patched_local = 0
-        _patched_modules = []
+        def _maybe_exit(label):
+            if _PROBE_EXIT_AFTER_FIRST:
+                print(f"[fixture] PROBE_ONLY: exiting cleanly after {label}.",
+                      flush=True)
+                # os._exit bypasses atexit handlers — that's fine here, the
+                # fire-check is only useful when we *don't* exit early.
+                os._exit(0)
+
+        # --- modern fused na2d ---
+        _orig_na2d = getattr(_natten, "na2d", None)
+        _na2d_capture = None
+        if _orig_na2d is not None:
+            def _na2d_capture(query, key, value, kernel_size, *args, **kwargs):
+                n = _na2d_n["n"]
+                _na2d_n["n"] = n + 1
+                tag = f"natten_call{n}"
+                out = _orig_na2d(query, key, value, kernel_size, *args, **kwargs)
+                payload = {
+                    "func": "na2d",
+                    "q": query.detach().cpu(),
+                    "k": key.detach().cpu(),
+                    "v": value.detach().cpu(),
+                    "out": out.detach().cpu(),
+                    "kernel_size": kernel_size,
+                    "dilation": kwargs.get("dilation",
+                                           args[1] if len(args) > 1 else 1),
+                    "stride": kwargs.get("stride",
+                                         args[0] if len(args) > 0 else 1),
+                    "scale": kwargs.get("scale", None),
+                    "is_causal": kwargs.get("is_causal", False),
+                    "backend": kwargs.get("backend", None),
+                    "shapes_str": (
+                        f"q={tuple(query.shape)} k={tuple(key.shape)} "
+                        f"v={tuple(value.shape)} out={tuple(out.shape)} "
+                        f"ks={kernel_size} dilation={kwargs.get('dilation', 1)}"
+                    ),
+                }
+                _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+                _maybe_exit(tag)
+                return out
+            _natten.na2d = _na2d_capture
+
+        # --- legacy split path: na2d_qk + na2d_av ---
+        _functional = getattr(_natten, "functional", None)
+        _orig_qk = getattr(_functional, "na2d_qk", None) if _functional else None
+        _orig_av = getattr(_functional, "na2d_av", None) if _functional else None
+
+        _qk_capture = None
+        if _orig_qk is not None:
+            def _qk_capture(q, k, *args, **kwargs):
+                n = _na2d_qk_n["n"]
+                _na2d_qk_n["n"] = n + 1
+                tag = f"natten_qk_call{n}"
+                out = _orig_qk(q, k, *args, **kwargs)
+                payload = {
+                    "func": "na2d_qk",
+                    "q": q.detach().cpu(),
+                    "k": k.detach().cpu(),
+                    "out": out.detach().cpu(),
+                    "kernel_size": kwargs.get("kernel_size"),
+                    "dilation": kwargs.get("dilation", 1),
+                    "shapes_str": (
+                        f"q={tuple(q.shape)} k={tuple(k.shape)} "
+                        f"out={tuple(out.shape)} "
+                        f"ks={kwargs.get('kernel_size')} "
+                        f"dilation={kwargs.get('dilation', 1)}"
+                    ),
+                }
+                _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+                # Do NOT exit here — wait for the matching AV call so we
+                # capture a paired (qk, av) fixture before bailing out.
+                return out
+            _natten.functional.na2d_qk = _qk_capture
+
+        _av_capture = None
+        if _orig_av is not None:
+            def _av_capture(attn, value, *args, **kwargs):
+                n = _na2d_av_n["n"]
+                _na2d_av_n["n"] = n + 1
+                tag = f"natten_av_call{n}"
+                out = _orig_av(attn, value, *args, **kwargs)
+                payload = {
+                    "func": "na2d_av",
+                    "attn": attn.detach().cpu(),
+                    "v": value.detach().cpu(),
+                    "out": out.detach().cpu(),
+                    "kernel_size": kwargs.get("kernel_size"),
+                    "dilation": kwargs.get("dilation", 1),
+                    "shapes_str": (
+                        f"attn={tuple(attn.shape)} v={tuple(value.shape)} "
+                        f"out={tuple(out.shape)} "
+                        f"ks={kwargs.get('kernel_size')} "
+                        f"dilation={kwargs.get('dilation', 1)}"
+                    ),
+                }
+                _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+                # AV completes the legacy split attention — safe to exit
+                # in probe mode now that the paired qk/av is on disk.
+                _maybe_exit(tag)
+                return out
+            _natten.functional.na2d_av = _av_capture
+
+        # Rebind module-local copies in any importer that has already
+        # done `from natten import na2d` or `from natten.functional
+        # import na2d_qk, na2d_av`.  Match by object identity against
+        # the originals we just replaced.
+        _orig_to_wrapper = {}
+        if _orig_na2d is not None and _na2d_capture is not None:
+            _orig_to_wrapper[(id(_orig_na2d), "na2d")] = _na2d_capture
+        if _orig_qk is not None and _qk_capture is not None:
+            _orig_to_wrapper[(id(_orig_qk), "na2d_qk")] = _qk_capture
+        if _orig_av is not None and _av_capture is not None:
+            _orig_to_wrapper[(id(_orig_av), "na2d_av")] = _av_capture
+
+        _patched_local = []
         for _modname, _mod in list(_sys.modules.items()):
-            if _mod is None or _mod is _natten:
+            if _mod is None or _mod is _natten or _mod is _functional:
                 continue
-            try:
-                _local = getattr(_mod, "na2d", None)
-            except Exception:
-                continue
-            if _local is _orig_na2d:
+            for _attr in ("na2d", "na2d_qk", "na2d_av"):
                 try:
-                    setattr(_mod, "na2d", _na2d_capture)
-                    _patched_local += 1
-                    _patched_modules.append(_modname)
-                except Exception as _exc:
-                    print(f"[fixture] WARN: failed to rebind na2d in "
-                          f"{_modname}: {_exc}", flush=True)
-        print(f"[fixture] natten.na2d capture wrapper installed "
-              f"(natten.na2d + {_patched_local} local bindings: "
-              f"{_patched_modules})", flush=True)
+                    _local = getattr(_mod, _attr, None)
+                except Exception:
+                    continue
+                if _local is None:
+                    continue
+                wrapper = _orig_to_wrapper.get((id(_local), _attr))
+                if wrapper is not None:
+                    try:
+                        setattr(_mod, _attr, wrapper)
+                        _patched_local.append(f"{_modname}.{_attr}")
+                    except Exception as _exc:
+                        print(f"[fixture] WARN: failed to rebind {_attr} "
+                              f"in {_modname}: {_exc}", flush=True)
 
-        # Loud end-of-run check: if the wrapper installed but never
-        # fired, something else bypassed both the top-level and local
-        # rebinds (e.g. NAF was lazy-imported AFTER hook install, or
-        # natten was reimported, or NAF wraps na2d in a closure we
-        # missed).  We want this to scream in the rental log.
+        print(f"[fixture] natten capture installed: "
+              f"na2d={_orig_na2d is not None}, "
+              f"na2d_qk={_orig_qk is not None}, "
+              f"na2d_av={_orig_av is not None}; "
+              f"local rebinds: {_patched_local or '(none)'}", flush=True)
+
         def _natten_fire_check():
-            if _natten_call_counter["n"] == 0:
-                print("[fixture] !!! WARN: natten.na2d wrapper was "
-                      "installed but NEVER FIRED during this run.  "
-                      "Expected ~3 calls (one per NAF-bearing image_cond "
-                      "stage).  Check NAF's import path; the local-binding "
-                      "rebind walk may have run too early.", flush=True)
+            total = _na2d_n["n"] + _na2d_qk_n["n"] + _na2d_av_n["n"]
+            if total == 0:
+                print("[fixture] !!! WARN: ALL natten capture wrappers "
+                      "(na2d, na2d_qk, na2d_av) were installed but NEVER "
+                      "FIRED.  NAF call path bypassed everything we know "
+                      "about.  Inspect attentions.py / installed natten "
+                      "version on this box.", flush=True)
             else:
-                print(f"[fixture] natten.na2d wrapper fired "
-                      f"{_natten_call_counter['n']} time(s).", flush=True)
+                print(f"[fixture] natten wrappers fired — "
+                      f"na2d={_na2d_n['n']}, "
+                      f"na2d_qk={_na2d_qk_n['n']}, "
+                      f"na2d_av={_na2d_av_n['n']}.", flush=True)
         _atexit.register(_natten_fire_check)
     except Exception as exc:
-        print(f"[fixture] WARN: cannot install natten.na2d capture: {exc}",
+        print(f"[fixture] WARN: cannot install natten capture: {exc}",
               flush=True)
 
     # --- per-step sampler dumps -------------------------------------------
