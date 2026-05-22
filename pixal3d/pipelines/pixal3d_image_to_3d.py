@@ -605,7 +605,9 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
                 layout=self.pbr_attr_layout
             )
-            for attr in ("fdg_coords", "fdg_dual_vertices", "fdg_intersected", "fdg_split_weight"):
+            for attr in ("fdg_coords", "fdg_dual_vertices",
+                         "fdg_intersected", "fdg_split_weight",
+                         "fdg_h_feats"):
                 if hasattr(m, attr):
                     setattr(mesh_with_voxel, attr, getattr(m, attr))
             out_mesh.append(mesh_with_voxel)
