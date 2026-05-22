@@ -53,18 +53,33 @@ Captured directions to pick from for future sessions.
 >    bilinear sampling boundary handling, fp16/fp32 accumulators in
 >    DINOv3+NAF, texture bake step.  Don't conflate with geometry.
 
-1. **Decisive sieve test: load CUDA stage-08 mesh, run only Mac
-   cleanup chain.**  We have `fixtures/cuda/08_to_glb_geometry.pt`
-   (402MB).  Convert to the `.npz` format expected by
-   `generate_mps.py --load-mesh` (keys: vertices, faces, coords,
-   attrs, origin, voxel_size, resolution + optional fdg_*) and run
-   the cleanup-and-bake path.  Outcome split:
-     - Result **sealed** → bug is in Mac mesh extraction
-       (`pixal3d/utils/mesh_extract.py`).  Next: audit CPU
-       `flexible_dual_grid_to_mesh` for missing edge cases.
-     - Result **sieve** → bug is in Mac cleanup chain regardless of
-       input quality.  Next: bisect the chain stages on the same
-       pre-extracted CUDA mesh.
+1. **DONE — sieve localized to mesh extraction.**  Decisive test run
+   end of session 7 via `scratch/sieve_test_cleanup_only.py`: loaded
+   CUDA's stage-08 pre-extracted mesh, ran ONLY our Mac cleanup chain
+   (Pedro's Metal: `fill_holes → simplify → dedup → repair_nme →
+   small_cc → fill_holes_2 → simplify_target → unify`).  Result:
+   **sealed shell with one tiny hole** — equivalent to CUDA's own
+   cleaned mesh quality.  Cleanup chain runs in 1 second total.
+   → **The sieve culprit is `pixal3d/utils/mesh_extract.py` CPU
+   `flexible_dual_grid_to_mesh` fallback.**  Likely missing edge
+   cases for partial quads / degenerate cells / boundary handling vs
+   the CUDA o_voxel kernel.  Output saved at
+   `fixtures/sieve_test_stage08/cleanup_only.glb`.
+2. **Next session priority: audit & fix `mesh_extract.py`.**
+   - Source of truth: CUDA o_voxel kernel.  Likely lives in
+     `CuMesh/src/` or one of the upstream Pixal3D submodules.
+     Need to find the canonical `flexible_dual_grid_to_mesh`
+     implementation in CUDA.
+   - Pedro's `mtlmesh/src/metal/remesh.metal` may contain a related
+     extraction kernel — check whether it covers our use case.
+   - Likely-missing logic categories: partial-quad handling on cell
+     boundaries (FDG can produce non-quad faces when the isosurface
+     intersects a cell edge sub-corner), degenerate cells, NME-free
+     guarantees on output topology.
+3. **Investigate the back-of-tower DiT difference** (image 28 from
+   session 7 user notes).  Mac and CUDA produce subtly different
+   topology in specific regions for the same seed.  Smaller concern
+   than the sieve; only worth chasing once geometry is fixed.
 2. **Investigate the coord-convention smoking gun.**  CUDA bbox is
    long-axis-Y (~0.69 × 0.88 × 0.62), all our Mac outputs are
    long-axis-Z (~0.69 × 0.60 × 0.88).  Shared between two independent
@@ -80,19 +95,24 @@ Captured directions to pick from for future sessions.
 
 ## Suspect lists (split by symptom)
 
-### Geometry sieve (high-priority — addresses the dominant remaining gap)
+### Geometry sieve (LOCALIZED — bug is in mesh extraction)
 
-- **CPU `flexible_dual_grid_to_mesh` in `pixal3d/utils/mesh_extract.py`** —
-  may be missing edge cases the CUDA o_voxel extraction handles.  The
-  904K NMEs in our FDG output could be a symptom of this.  Decisive
-  test: stage-08 replay (see #1 in ordered list).
-- **Cleanup chain destroying good input** — `mps_replay_cuda07` showed
-  destruction even with CUDA's clean SLat output, but that replay still
-  ran our Mac extraction.  Stage-08 replay isolates this.
-- **`fill_holes` default perimeter too tight** — 3cm default leaves
-  ~50K medium holes (5–30 cm range) per the session-3 Blender audit.
-  Tune via `PIXAL3D_FILL_HOLES_PERIMETER`.  But this is a *symptom
-  patch* on top of a deeper bug, not the bug itself.
+- **`pixal3d/utils/mesh_extract.py` CPU `flexible_dual_grid_to_mesh`** —
+  this is the bug, confirmed end of session 7 via the stage-08 replay
+  test.  The cleanup chain is innocent.  Audit against the CUDA
+  reference (look at `CuMesh/` and upstream Pixal3D's o_voxel module
+  for the canonical kernel).  Likely missing logic: partial-quad
+  handling, degenerate-cell handling, NME-free output guarantees.
+
+### Retired suspects (confirmed innocent via stage-08 test)
+
+- ~~Cleanup chain destroying good input~~ — session 7 stage-08 replay
+  showed the chain produces a sealed shell when given CUDA's clean mesh.
+- ~~`fill_holes` default perimeter too tight~~ — same test showed Pedro's
+  Metal fill_holes at default 3e-2 handles CUDA's input cleanly.
+- ~~`small_cc` over-culling~~ — drops 132K verts on CUDA's clean input,
+  but the result still looks good; the legit-fragment-loss concern is
+  real but minor compared to the sieve.
 
 ### Texture fuzz (separate hunt — not relevant until geometry is fixed)
 

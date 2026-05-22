@@ -1028,3 +1028,36 @@ Run the **decisive sieve test**:
 - **Texture fuzz is independent of geometry sieve.**  Don't try to
   fix textures by fixing geometry or vice versa; they are separate
   hunts with separate suspects.
+
+### Session 7 close: sieve localized to mesh extraction
+
+The decisive stage-08 replay test (`scratch/sieve_test_cleanup_only.py`,
+gitignored as it lives under `scratch/`) loaded CUDA's pre-extracted
+mesh `fixtures/cuda/08_to_glb_geometry.pt` (849K verts, 981K faces) and
+ran ONLY our Mac cleanup chain (Pedro's Metal: `fill_holes → simplify
+→ dedup → repair_nme → small_cc → fill_holes_2 → simplify_target →
+unify`).  Total runtime: **1 second**.  Output: `fixtures/sieve_test_stage08/
+cleanup_only.glb`, V=758K, F=1.04M, vol=0.0056 (matches CUDA's 0.0055
+to fp32 precision).
+
+**Visual result: sealed shell with one tiny hole** — equivalent quality
+to CUDA's own cleaned mesh (which itself has a few small holes, image
+27 in user notes; trimesh marks it not-watertight but visually clean).
+
+**Confirmed verdict:**
+- ✅ Cleanup chain works correctly when fed good input
+- ❌ The sieve is upstream — in our **mesh extraction**
+  (`pixal3d/utils/mesh_extract.py` CPU `flexible_dual_grid_to_mesh`
+  fallback)
+
+User also flagged a secondary observation: **back-of-tower topology
+differs** between our Mac generation and CUDA generation for the same
+seed (image 28).  This is a DiT-side concern — not the dominant
+geometry bug, but worth investigating once the sieve is fixed.
+
+Next-session work concentrates on a single file: audit
+`pixal3d/utils/mesh_extract.py` against the canonical CUDA
+`flexible_dual_grid_to_mesh` (probably in `CuMesh/` or the upstream
+Pixal3D o_voxel submodule), identify the missing edge cases, port them
+over.  Pedro's `mtlmesh/src/metal/remesh.metal` may also be worth a
+look — could replace our CPU extraction with a Metal-native one.
