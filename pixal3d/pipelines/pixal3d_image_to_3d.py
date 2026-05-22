@@ -592,17 +592,27 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         torch.cuda.synchronize()
         for m, v in zip(meshes, tex_voxels):
             m.fill_holes()
-            out_mesh.append(
-                MeshWithVoxel(
-                    m.vertices, m.faces,
-                    origin = [-0.5, -0.5, -0.5],
-                    voxel_size = 1 / resolution,
-                    coords = v.coords[:, 1:],
-                    attrs = v.feats,
-                    voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
-                    layout=self.pbr_attr_layout
-                )
+            mesh_with_voxel = MeshWithVoxel(
+                m.vertices, m.faces,
+                origin = [-0.5, -0.5, -0.5],
+                voxel_size = 1 / resolution,
+                coords = v.coords[:, 1:],
+                attrs = v.feats,
+                voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
+                layout=self.pbr_attr_layout
             )
+            # Preserve the per-mesh FDG-decoder tensors that
+            # FlexiDualGridVaeDecoder.forward stashed on `m`.  MeshWithVoxel's
+            # __init__ only copies vertices/faces/coords/attrs/origin/
+            # voxel_size; without this re-attach, the fdg_* + fdg_h_feats
+            # attrs are silently lost when _fixture_to_cpu serialises the
+            # stage-07 dump.
+            for attr in ("fdg_coords", "fdg_dual_vertices",
+                         "fdg_intersected", "fdg_split_weight",
+                         "fdg_h_feats"):
+                if hasattr(m, attr):
+                    setattr(mesh_with_voxel, attr, getattr(m, attr))
+            out_mesh.append(mesh_with_voxel)
         return out_mesh
     
     @torch.no_grad()
