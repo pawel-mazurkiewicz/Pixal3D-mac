@@ -104,8 +104,12 @@ def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
     target = fixture_dir if fixture_dir is not None else PIXAL3D_DUMP_FIXTURES
     if not target:
         return
+    # Probe-only filter: keep any fixture whose name mentions "natten"
+    # at all.  Matches both the legacy stage-tagged labels
+    # ("01b_natten_shape_512") and the new sequential labels
+    # ("natten_call0", "natten_qk_call0", "natten_av_call0").
     if os.environ.get("PIXAL3D_NATTEN_PROBE_ONLY", "").strip() == "1" \
-            and "_natten_" not in name:
+            and "natten" not in name:
         return
     os.makedirs(target, exist_ok=True)
     out = os.path.join(target, f"{name}.pt")
