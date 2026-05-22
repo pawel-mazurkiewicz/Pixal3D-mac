@@ -65,17 +65,47 @@ Captured directions to pick from for future sessions.
    cases for partial quads / degenerate cells / boundary handling vs
    the CUDA o_voxel kernel.  Output saved at
    `fixtures/sieve_test_stage08/cleanup_only.glb`.
-2. **Next session priority: audit & fix `mesh_extract.py`.**
-   - Source of truth: CUDA o_voxel kernel.  Likely lives in
-     `CuMesh/src/` or one of the upstream Pixal3D submodules.
-     Need to find the canonical `flexible_dual_grid_to_mesh`
-     implementation in CUDA.
-   - Pedro's `mtlmesh/src/metal/remesh.metal` may contain a related
-     extraction kernel — check whether it covers our use case.
-   - Likely-missing logic categories: partial-quad handling on cell
-     boundaries (FDG can produce non-quad faces when the isosurface
-     intersects a cell edge sub-corner), degenerate cells, NME-free
-     guarantees on output topology.
+2. **Next session START HERE — audit & fix the FDG extractor.**
+
+   Canonical reference source (found end of session 7):
+   ```
+   /Users/pawelma/code/ai/trellis-mac/TRELLIS.2/o-voxel/src/convert/
+     flexible_dual_grid.cpp        # 32.9K — the real implementation
+     api.h                         # function signatures
+   /Users/pawelma/code/ai/trellis-mac/TRELLIS.2/o-voxel/o_voxel/convert/
+     flexible_dual_grid.py         # 283-line Python wrapper around _C
+   ```
+
+   Our (buggy) Python port:
+   ```
+   /Users/pawelma/code/ai/Pixal3D/pixal3d/utils/mesh_extract.py
+     (283 lines; has both directions: mesh_to_flexible_dual_grid and
+      flexible_dual_grid_to_mesh; has partial-quad constants but
+      apparently mis-handles them)
+   ```
+
+   Pedro's possibly-adjacent Metal kernel (NOT a direct FDG port —
+   it's dual contouring, related family):
+   ```
+   /Users/pawelma/code/ai/mtlmesh/src/metal/remesh.metal
+     simple_dual_contour_u32_kernel / simple_dual_contour_u64_kernel
+   ```
+
+   **Concrete first action**: dispatch a fresh opus subagent to audit
+   `flexible_dual_grid.cpp` vs our `mesh_extract.py` (same pattern
+   that worked for simplify in session 7).  Prompt should ask for:
+   1. Algorithm structure of upstream — CUDA-required (atomics,
+      `__global__` kernels) vs torch-tensor-portable.
+   2. Specific gaps in our Python port — partial-quad handling,
+      degenerate cells, NME-free output guarantees, boundary cases.
+   3. Recommended path: patch the Python port (small gaps) vs Metal
+      port (structural CUDA dependence) vs adopt-mtlmesh-dual-contour
+      (different algorithm, different topology than CUDA — fallback).
+
+   Once the gap shape is known, the implementation move is clear.
+   Session 7's audit-then-integrate flow took ~half a session to
+   produce the 50% speedup; FDG fix is potentially the same pattern
+   for the geometry sieve.
 3. **Investigate the back-of-tower DiT difference** (image 28 from
    session 7 user notes).  Mac and CUDA produce subtly different
    topology in specific regions for the same seed.  Smaller concern
