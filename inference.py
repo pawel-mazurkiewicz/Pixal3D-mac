@@ -64,7 +64,13 @@ def _fixture_to_cpu(x):
         # mesh-like (MeshWithVoxel from pipeline, trimesh.Geometry, etc.)
         out = {}
         for attr in ("vertices", "faces", "attrs", "coords", "uv",
-                     "vertex_normals", "face_normals", "visual"):
+                     "vertex_normals", "face_normals", "visual",
+                     # Pre-extraction FDG tensors (set by
+                     # FlexiDualGridVaeDecoder.forward). Capturing them at
+                     # stage-07 lets a Mac box replay only the FDG -> mesh
+                     # + cleanup steps on CUDA's exact inputs.
+                     "fdg_coords", "fdg_dual_vertices",
+                     "fdg_intersected", "fdg_split_weight"):
             if hasattr(x, attr):
                 v = getattr(x, attr)
                 if v is not None:

@@ -100,11 +100,27 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
             intersected = h.replace(h.feats[..., 3:6] > 0)
             quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
-            mesh = [Mesh(*flexible_dual_grid_to_mesh(
-                v.coords[:, 1:], v.feats, i.feats, q.feats,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=self.resolution,
-                train=False
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+            mesh = []
+            for v, i, q in zip(vertices, intersected, quad_lerp):
+                fdg_coords = v.coords[:, 1:]
+                fdg_dual_vertices = v.feats
+                fdg_intersected = i.feats
+                fdg_split_weight = q.feats
+                mesh_item = Mesh(*flexible_dual_grid_to_mesh(
+                    fdg_coords, fdg_dual_vertices, fdg_intersected, fdg_split_weight,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    grid_size=self.resolution,
+                    train=False
+                ))
+                # Stash the pre-extraction FDG tensors on the mesh so that
+                # _fixture_to_cpu can dump them at stage-07.  This is the
+                # input side of `flexible_dual_grid_to_mesh`; capturing it
+                # lets a Mac box replay only the FDG -> mesh + cleanup steps
+                # on CUDA's exact inputs and compare against CUDA's output.
+                mesh_item.fdg_coords = fdg_coords
+                mesh_item.fdg_dual_vertices = fdg_dual_vertices
+                mesh_item.fdg_intersected = fdg_intersected
+                mesh_item.fdg_split_weight = fdg_split_weight
+                mesh.append(mesh_item)
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)
