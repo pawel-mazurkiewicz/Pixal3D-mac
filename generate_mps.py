@@ -371,6 +371,26 @@ def load_runtime_deps():
     Pixal3DImageTo3DPipeline = _Pixal3DImageTo3DPipeline
     EXPORT_ROTATION = np.array(EXPORT_ROTATION_ROWS, dtype=np.float64)
 
+    # ---- natten dispatch backend selection ----
+    # PIXAL3D_NATTEN_MPS_ENABLE=1 -> route natten.na2d on MPS tensors to
+    # our in-tree Metal kernels (natten-mps).  Validated against CUDA
+    # cutlass-fna at NAF's production shapes to ~1e-3 rel — see
+    # natten-mps/tests/test_cuda_golden.py.
+    # Default                     -> fall back to the pure-PyTorch
+    # _torch_na2d implementation below (slow but bulletproof, was the
+    # source of the 2.5e-2 z_proj RED that spawned this port).
+    if os.environ.get("PIXAL3D_NATTEN_MPS_ENABLE", "").strip() == "1":
+        try:
+            import natten_mps as _natten_mps  # noqa: F401  installs shim
+            print("[Pixal3D] natten-mps Metal dispatch active "
+                  f"(version {getattr(_natten_mps, '__version__', '?')})",
+                  flush=True)
+            return  # skip the pure-PyTorch fallback below
+        except ImportError as _exc:
+            print(f"[Pixal3D] WARN: PIXAL3D_NATTEN_MPS_ENABLE=1 set but "
+                  f"natten_mps not importable: {_exc} — falling back to "
+                  f"pure-PyTorch _torch_na2d.", flush=True)
+
     # Patch NATTEN's na2d before torch.hub.load loads the NAF upsampler.
     # The hub-cached attentions.py hardcodes backend="cutlass-fna" which in
     # this NATTEN wheel requires CUDA + libnatten.  The only non-CUDA backend
