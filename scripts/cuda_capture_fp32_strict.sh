@@ -55,7 +55,12 @@ export CUDNN_LOGDEST_DBG="${CUDNN_LOG}"
 TMP_RUNNER=$(mktemp /tmp/fp32_strict_runner.XXXX.py)
 trap "rm -f ${TMP_RUNNER}" EXIT
 cat > "${TMP_RUNNER}" <<EOF
-import torch, os
+import os, sys
+# Repo root must be on sys.path so 'from pixal3d.pipelines ...' resolves
+# against ./pixal3d/ (this package is shipped uninstalled; no setup.py).
+sys.path.insert(0, "${PWD}")
+
+import torch
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.benchmark = False
@@ -66,7 +71,7 @@ print(f"[fp32-strict] allow_tf32={torch.backends.cuda.matmul.allow_tf32}/{torch.
 print(f"[fp32-strict] CUDA capability: {torch.cuda.get_device_capability(0) if torch.cuda.is_available() else 'no cuda'}",
       flush=True)
 
-import runpy, sys
+import runpy
 sys.argv = ["inference.py",
             "--image", "${IMAGE}",
             "--seed", "${SEED}",
