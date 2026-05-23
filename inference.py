@@ -126,6 +126,232 @@ def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
         sys.exit(0)
 
 
+def _parse_csv_env(name: str) -> set[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return set()
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {
+        "1", "true", "yes", "on", "full", "sample", "samples",
+        "summary", "trace",
+    }
+
+
+def _safe_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        print(f"[fixture] WARN: {name}={raw!r} is not an int; using {default}.",
+              flush=True)
+        return default
+
+
+def _sanitize_fixture_part(s: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+
+
+def _tensor_trace_payload(name: str, x, *, sample_count: int,
+                          include_full: bool) -> dict:
+    """Compact, diffable tensor capture for large NAF internals."""
+    payload = {
+        "name": name,
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "device": str(x.device),
+        "numel": int(x.numel()),
+        "sample_count_requested": int(sample_count),
+    }
+    if x.numel() == 0:
+        payload["samples"] = {"indices": torch.empty(0, dtype=torch.long),
+                              "values": torch.empty(0)}
+        if include_full:
+            payload["full"] = x.detach()
+        return payload
+
+    with torch.no_grad():
+        xd = x.detach()
+        try:
+            xf = xd.float() if xd.dtype not in (
+                torch.float64, torch.float32,
+            ) else xd
+            payload["summary"] = {
+                "mean": float(xf.mean().item()),
+                "std": float(xf.std(unbiased=False).item()),
+                "min": float(xf.min().item()),
+                "max": float(xf.max().item()),
+                "l2": float(torch.linalg.vector_norm(xf).item()),
+            }
+        except Exception as exc:
+            payload["summary_error"] = repr(exc)
+
+        n = min(sample_count, int(xd.numel()))
+        try:
+            sample_idx_cpu = torch.linspace(
+                0, int(xd.numel()) - 1, steps=n, dtype=torch.float64,
+                device="cpu",
+            ).round().to(torch.long)
+            coords_cpu = torch.unravel_index(sample_idx_cpu, tuple(xd.shape))
+            coords_dev = tuple(c.to(xd.device) for c in coords_cpu)
+            sample_values = xd[coords_dev].detach().cpu()
+            payload["samples"] = {
+                "indices": sample_idx_cpu,
+                "values": sample_values,
+            }
+            if sample_values.is_floating_point():
+                payload["sample_finite"] = bool(
+                    torch.isfinite(sample_values).all().item()
+                )
+        except Exception as exc:
+            payload["sample_error"] = repr(exc)
+
+        if include_full:
+            payload["full"] = xd
+    return payload
+
+
+def _install_naf_trace_hooks(naf_model, *, stage_name: str,
+                             fixture_dir: str) -> bool:
+    """Install low-bandwidth NAF internals capture hooks."""
+    if not _env_flag("PIXAL3D_NAF_TRACE"):
+        return False
+    if getattr(naf_model, "_pixal3d_naf_trace_installed", False):
+        return False
+
+    import types
+    import functools
+    import torch.nn as nn
+
+    sample_count = _safe_int_env("PIXAL3D_NAF_TRACE_SAMPLES", 4096)
+    full_mode = os.environ.get("PIXAL3D_NAF_TRACE", "").strip().lower() == "full"
+    full_selectors = _parse_csv_env("PIXAL3D_NAF_TRACE_FULL")
+    dump_counts: dict[str, int] = {}
+
+    def wants_full(label: str) -> bool:
+        if full_mode:
+            return True
+        lower = label.lower()
+        return any(sel in lower for sel in full_selectors)
+
+    def dump(label: str, value) -> None:
+        if not torch.is_tensor(value):
+            return
+        safe_label = _sanitize_fixture_part(label)
+        idx = dump_counts.get(safe_label, 0)
+        dump_counts[safe_label] = idx + 1
+        tag = f"{stage_name}_naf_{safe_label}"
+        if idx:
+            tag = f"{tag}_call{idx}"
+        payload = _tensor_trace_payload(
+            f"{stage_name}.naf.{label}",
+            value,
+            sample_count=sample_count,
+            include_full=wants_full(label),
+        )
+        _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+
+    def hook_output(label: str):
+        def _hook(_module, _args, output):
+            if torch.is_tensor(output):
+                dump(label, output)
+            elif isinstance(output, (list, tuple)):
+                for i, item in enumerate(output):
+                    dump(f"{label}.out{i}", item)
+        return _hook
+
+    def hook_input_output(label: str):
+        def _hook(_module, args, output):
+            if args:
+                dump(f"{label}.input", args[0])
+            if torch.is_tensor(output):
+                dump(f"{label}.output", output)
+        return _hook
+
+    hooked = 0
+    for name, module in naf_model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.GroupNorm, nn.SiLU)):
+            module.register_forward_hook(hook_output(name))
+            hooked += 1
+        elif name in {
+            "image_encoder.encoder",
+            "image_encoder.sem_encoder",
+            "image_encoder.rope",
+            "query_encoder",
+            "key_encoder",
+        }:
+            module.register_forward_hook(hook_input_output(name))
+            hooked += 1
+
+    image_encoder = getattr(naf_model, "image_encoder", None)
+    if image_encoder is not None and not getattr(
+        image_encoder, "_pixal3d_trace_wrapped", False
+    ):
+        orig_forward_encoder = image_encoder.forward_encoder
+
+        @functools.wraps(orig_forward_encoder)
+        def wrapped_forward_encoder(self, x, output_size):
+            dump("image_encoder.forward_encoder.input", x)
+            if getattr(self, "use_encoder", False):
+                x = torch.cat([self.encoder(x), self.sem_encoder(x)], dim=1)
+                dump("image_encoder.forward_encoder.concat", x)
+            import torch.nn.functional as F
+            x = F.adaptive_avg_pool2d(x, output_size=output_size)
+            dump("image_encoder.forward_encoder.pooled", x)
+            return x
+
+        image_encoder.forward_encoder = types.MethodType(
+            wrapped_forward_encoder, image_encoder
+        )
+        image_encoder._pixal3d_trace_wrapped = True
+
+    upsampler = getattr(naf_model, "upsampler", None)
+    if upsampler is not None and not getattr(
+        upsampler, "_pixal3d_trace_wrapped", False
+    ):
+        resize_counter = {"n": 0}
+        orig_resize = upsampler._resize
+
+        @functools.wraps(orig_resize)
+        def wrapped_resize(self, x, size, dtype):
+            out = orig_resize(x, size, dtype)
+            idx = resize_counter["n"]
+            resize_counter["n"] = idx + 1
+            kind = "k" if idx % 2 == 0 else "v"
+            dump(f"upsampler.resize_{kind}.input", x)
+            dump(f"upsampler.resize_{kind}.output_heads_last", out)
+            return out
+
+        def _upsampler_pre_hook(_module, args):
+            resize_counter["n"] = 0
+            if len(args) >= 1:
+                dump("upsampler.forward.q_raw", args[0])
+            if len(args) >= 2:
+                dump("upsampler.forward.k_raw", args[1])
+            if len(args) >= 3:
+                dump("upsampler.forward.v_raw", args[2])
+
+        upsampler._resize = types.MethodType(wrapped_resize, upsampler)
+        upsampler.register_forward_pre_hook(_upsampler_pre_hook)
+        upsampler.register_forward_hook(hook_output("upsampler.forward.output"))
+        upsampler._pixal3d_trace_wrapped = True
+
+    naf_model._pixal3d_naf_trace_installed = True
+    print(f"[fixture] NAF trace hooks installed for {stage_name} "
+          f"({hooked} module hooks, samples={sample_count}, "
+          f"full={'all' if full_mode else sorted(full_selectors) or 'none'})",
+          flush=True)
+    return True
+
+
 def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     """Monkey-patch pipeline stage methods to dump outputs after each call.
 
@@ -224,6 +450,23 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
             print(f"[fixture] WARN: cannot hook {attr}: {exc}", flush=True)
     print(f"[fixture] image_cond_model hooks installed ({image_cond_installed}/4)",
           flush=True)
+
+    naf_trace_installed = 0
+    for fname, attr in image_cond_models:
+        model = getattr(pipeline, attr, None)
+        naf_model = getattr(model, "naf_model", None) if model is not None else None
+        if naf_model is None:
+            continue
+        try:
+            if _install_naf_trace_hooks(naf_model, stage_name=fname,
+                                        fixture_dir=fixture_dir):
+                naf_trace_installed += 1
+        except Exception as exc:
+            print(f"[fixture] WARN: cannot install NAF trace for {attr}: {exc}",
+                  flush=True)
+    if _env_flag("PIXAL3D_NAF_TRACE"):
+        print(f"[fixture] NAF trace hooks installed ({naf_trace_installed}/3)",
+              flush=True)
 
     # --- natten.na2d input/output capture ---------------------------------
     # NAF (valeoai/NAF) calls natten.na2d(q, k, v, kernel_size=(9,9),
@@ -537,6 +780,8 @@ def _dump_run_metadata(fixture_dir: str, *, image_path: str, args_dict: dict,
         "env": {k: os.environ.get(k) for k in [
             "ATTN_BACKEND", "SPARSE_CONV_BACKEND", "SPARSE_ATTN_BACKEND",
             "PYTORCH_CUDA_ALLOC_CONF", "PIXAL3D_DUMP_FIXTURES",
+            "PIXAL3D_NAF_TRACE", "PIXAL3D_NAF_TRACE_SAMPLES",
+            "PIXAL3D_NAF_TRACE_FULL", "PIXAL3D_NATTEN_PROBE_ONLY",
         ] if os.environ.get(k) is not None},
     }
     out = os.path.join(fixture_dir, "00_metadata.json")
