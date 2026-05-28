@@ -57,16 +57,23 @@ def install(force: bool = False) -> bool:
     # object identity) to the original we just replaced.  This is the
     # same trick used by the rental capture wrapper — proven necessary
     # for NAF's `from natten import na2d` import pattern.
+    #
+    # IMPORTANT: probe each module's __dict__ directly rather than via
+    # getattr().  Packages with lazy module loaders (notably transformers'
+    # _LazyModule) implement __getattr__ to resolve names on demand; a blind
+    # getattr(mod, "na2d") trips that loader for EVERY module, spamming
+    # hundreds of "[transformers] Accessing `na2d` from ..." alias warnings.
+    # A genuine `from natten import na2d` binding lives in the module's
+    # __dict__, so __dict__.get finds it without triggering any __getattr__.
     import sys as _sys
     _patched_local = []
     for _modname, _mod in list(_sys.modules.items()):
         if _mod is None or _mod is _natten:
             continue
-        try:
-            _local = getattr(_mod, "na2d", None)
-        except Exception:
+        _md = getattr(_mod, "__dict__", None)
+        if not isinstance(_md, dict):
             continue
-        if _local is _orig_na2d:
+        if _md.get("na2d", None) is _orig_na2d:
             try:
                 setattr(_mod, "na2d", _na2d_dispatch)
                 _patched_local.append(_modname)
