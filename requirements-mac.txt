@@ -11,16 +11,19 @@
 #   .venv-py310/bin/pip install -U pip wheel setuptools
 #   uv pip install --python .venv-py310/bin/python -r requirements-mac.txt
 #
-#   # Vendored native Metal packages (compile xcrun .metal -> .metallib):
-#   for p in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel; do
+#   # Vendored native Metal packages (compile xcrun .metal -> .metallib;
+#   # natten-mps is pure-Python but install it the same way):
+#   for p in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel natten-mps; do
 #     uv pip install --python .venv-py310/bin/python -e extern/$p --no-build-isolation
 #   done
 #
 # NOTES
-# - natten-mps==0.3.0 below is the COMMUNITY ssmall256 package (provides
-#   natten_mps.compat.v020, imported by generate_mps.py). The in-house
-#   extern/natten-mps (pawel-mazurkiewicz) is kept as source-of-truth but is
-#   NOT installed from extern — see extern/README.md.
+# - natten-mps is the IN-HOUSE extern/natten-mps (pawel-mazurkiewicz), installed
+#   editable from the extern loop above — NOT the community ssmall256 PyPI
+#   package. Ours provides natten_mps.compat.v020.na2d backed by split Metal
+#   kernels (na2d_qk + na2d_av) that handle NAF's asymmetric K=64/V=256, which
+#   the community fused na2d rejects (forcing a pure-PyTorch fallback). Do not
+#   add `natten-mps` to the pinned list below — it must come from extern/.
 # - mtlgemm (flex_gemm) requires torch>=2.11 on Darwin for
 #   at::mps::dispatch_sync_with_rethrow.
 # - numpy is pinned <2.3 because 2.4+ dropped Python 3.10.
@@ -71,7 +74,6 @@ mdurl==0.1.2
 moderngl==5.12.0
 moge @ git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8
 mpmath==1.3.0
-natten-mps==0.3.0
 natten==0.21.0
 networkx==3.4.2
 numpy==2.2.6

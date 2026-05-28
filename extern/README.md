@@ -12,7 +12,7 @@ the in-tree Python 3.10 venv (`.venv-py310/`).
 | `mtlgemm/` | [pedronaugusto/mtlgemm](https://github.com/pedronaugusto/mtlgemm) | Provides `flex_gemm` — sparse Conv3D + grid_sample_3d Metal kernels. |
 | `mtlbvh/` | [pedronaugusto/mtlbvh](https://github.com/pedronaugusto/mtlbvh) | Provides `mtlbvh` — BVH ray queries used by mesh export. |
 | `mtldiffrast/` | [pedronaugusto/mtldiffrast](https://github.com/pedronaugusto/mtldiffrast) | Provides `mtldiffrast` — Metal differentiable rasterizer. |
-| `natten-mps/` | [pawel-mazurkiewicz/natten-mps](https://github.com/pawel-mazurkiewicz/natten-mps) | Provides `natten_mps` — Metal port of NATTEN. In-house package, **kept in-tree as source-of-truth but NOT pip-installed**: production currently uses the unrelated `ssmall256/natten-mps==0.3.0` from PyPI (which provides `natten_mps.compat.v020` that `generate_mps.py` imports). Switching to use our in-house package is a follow-up refactor of `generate_mps.py`'s NAF wiring. |
+| `natten-mps/` | [pawel-mazurkiewicz/natten-mps](https://github.com/pawel-mazurkiewicz/natten-mps) | Provides `natten_mps` — in-house Metal port of NATTEN. **Now the active NAF attention path** (installed editable from the extern loop; replaced the community `ssmall256/natten-mps==0.3.0`). Our `compat/v020.py` mirrors the community API that `generate_mps.py` imports, but its split kernels (`na2d_qk` + `na2d_av`) handle NAF's asymmetric K=64/V=256 — which the community fused `na2d` rejected, forcing a pure-PyTorch fallback. Validated ~1e-3 vs CUDA cutlass-fna golden (S11). Note: shifts the mesh ~0.4% vs the PyTorch-fallback baseline (fp32 reduction-order difference at the NAF→DiT boundary). |
 | `o_voxel/` | [pedronaugusto/trellis2-apple](https://github.com/pedronaugusto/trellis2-apple) (subdir `o-voxel/`) @ commit 6055b86 | Provides `o_voxel` — post-process / mesh-extract / texture-bake pipeline (`o_voxel.postprocess.to_glb`). Pedro's Mac-adapted fork of `microsoft/TRELLIS.2`'s o-voxel subdir. **Not subtree-vendored** because git subtree cannot extract a single subdirectory of a remote repo cleanly; copied as plain files. Manual diff-based sync from upstream. |
 
 ## Why these are in-tree (not pip-installed)
@@ -34,12 +34,14 @@ contained while preserving the ability to pull upstream fixes.
 All packages install editable into `.venv-py310/`:
 
 ```bash
-for pkg in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel; do
+for pkg in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel natten-mps; do
   .venv-py310/bin/pip install -e extern/$pkg --no-build-isolation
 done
-# natten-mps: NOT installed from extern (see table). Install community version:
-.venv-py310/bin/pip install natten-mps==0.3.0
 ```
+
+`natten-mps` is pure-Python (no Metal compile step), but installing it the
+same way is harmless. It must come from `extern/`, not the community PyPI
+`natten-mps==0.3.0` — see the table note.
 
 `--no-build-isolation` is required because some packages (notably mtlgemm)
 have rpath / link-time quirks that PEP 517's isolated build environment
