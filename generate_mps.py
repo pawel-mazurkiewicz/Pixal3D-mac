@@ -1497,6 +1497,17 @@ def _run_native_o_voxel_in_process(cmd: list[str]) -> int:
         print(f"[Export] In-process o_voxel bridge import failed ({exc}); "
               "falling back to subprocess.")
         return 127
+    # Pre-flight: confirm the real native o_voxel pipeline is importable in THIS
+    # interpreter.  The legacy 3.12 venv ships only a stub `o_voxel` without
+    # `postprocess`; the working package lives in .venv-py310 (or the old 3.11
+    # trellis-mac subprocess venv).  Return the 127 sentinel so the caller falls
+    # back to the subprocess bridge rather than the degraded texture baker.
+    try:
+        from o_voxel import postprocess as _ov_postprocess  # noqa: F401
+    except Exception as exc:
+        print(f"[Export] In-process o_voxel.postprocess unavailable ({exc}); "
+              "falling back to subprocess bridge.")
+        return 127
     try:
         rc = o_voxel_native_export.main(cmd[2:])
         return int(rc) if rc is not None else 0
@@ -1727,6 +1738,21 @@ def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, f
             if torch is not None and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
                 torch.mps.empty_cache()
             result_code = _run_native_o_voxel_in_process(cmd)
+            # 127 = in-process native o_voxel stack not importable in this
+            # interpreter (e.g. running under the legacy 3.12 venv whose o_voxel
+            # is a stub).  Transparently fall back to the subprocess bridge if a
+            # suitable Python (3.11 trellis-mac venv, etc.) can be found.
+            if result_code == 127:
+                fallback_python = _resolve_native_o_voxel_python(args)
+                if fallback_python is not None:
+                    print(f"[Export] Retrying native o_voxel via subprocess "
+                          f"({fallback_python})...")
+                    cmd[0] = str(fallback_python)
+                    result = subprocess.run(cmd, env=_native_o_voxel_env(glb_path), check=False)
+                    result_code = result.returncode
+                else:
+                    print("[Export] No subprocess o_voxel Python found; "
+                          "using fallback baker.")
         if result_code != 0:
             print(f"[Export] Native o_voxel export failed with exit code {result_code}; using fallback baker.")
             return False
