@@ -768,7 +768,7 @@ def load_runtime_deps():
 
                 _na2d_final = _na2d_community_or_fallback
                 print(f"[Pixal3D] natten-mps Metal dispatch active via "
-                      f"natten_mps.compat.v020 (community pkg "
+                      f"natten_mps.compat.v020 (in-house pkg "
                       f"v{getattr(_natten_mps_pkg, '__version__', '?')}) "
                       f"+ _torch_na2d per-call fallback", flush=True)
             except ImportError as _exc:
