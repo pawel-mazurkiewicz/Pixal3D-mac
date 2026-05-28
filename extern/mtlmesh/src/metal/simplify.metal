@@ -144,6 +144,11 @@ kernel void propagate_cost_kernel(
 
     ulong cost = pack_key_value_positive(int(tid), edge_collapse_costs[tid]);
 
+    // S19-fix: keep memory_order_relaxed (MSL only supports relaxed); the
+    // cross-dispatch ordering is enforced by the host command scheduler.
+    // S22-verified: MSL compiler rejects seq_cst for atomic_min_explicit
+    // on ulong ("order argument must be metal::memory_order_relaxed"), so
+    // Codex's seq_cst hypothesis can't be directly tested in MSL.
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
         atomic_min_explicit(&propagated_costs[vert2face[f]], cost, memory_order_relaxed);
     }
@@ -160,7 +165,16 @@ kernel void collapse_edges_kernel(
     device const int* vert2face [[buffer(3)]],
     device const int* vert2face_offset [[buffer(4)]],
     device const float* edge_collapse_costs [[buffer(5)]],
-    device const ulong* propagated_costs [[buffer(6)]],
+    // S19-fix: declared `volatile` so the compiler cannot cache reads in
+    // registers / tile L1.  Same physical buffer is bound as
+    // `device atomic_ulong*` to propagate_cost_kernel (line 137).  Without
+    // the volatile qualifier, the compiler may legally hoist or cache the
+    // bare-load reads at lines 200+, causing the mutual-agreement check to
+    // see stale UINT64_MAX or partial-update values instead of the final
+    // reduced cost → simultaneous collapses on shared-vertex edges →
+    // 92.6% NME explosion (S18 measurement).  MSL has no atomic_load on
+    // ulong, so `volatile` is the portable forced-non-cached read.
+    device const volatile ulong* propagated_costs [[buffer(6)]],
     device const uint8_t* vert_is_boundary [[buffer(7)]],
     constant int& E [[buffer(8)]],
     constant float& collapse_thresh [[buffer(9)]],
@@ -177,7 +191,11 @@ kernel void collapse_edges_kernel(
     int e1 = int(e & 0xFFFFFFFF);
     ulong pack = pack_key_value_positive(int(tid), cost);
 
-    // Check all neighboring faces agree this is their minimum-cost edge
+    // Check all neighboring faces agree this is their minimum-cost edge.
+    // S19-fix: bare loads on a `volatile` pointer (declared above).  The
+    // volatile qualifier forces the compiler to issue a fresh memory load
+    // each time and disallows caching the value in a register / hoisting
+    // out of the loop.
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
         if (propagated_costs[vert2face[f]] != pack) return;
     }
