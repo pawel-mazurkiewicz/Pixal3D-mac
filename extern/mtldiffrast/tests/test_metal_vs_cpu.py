@@ -53,7 +53,7 @@ def rasterize_ref(pos, tri, H, W):
         for px in range(W):
             fx = xs * px + xo
             fy = ys * py + yo
-            best_z = -2.0
+            best_z = 2.0  # far sentinel; nvdiffrast keeps the smallest z/w
             for t in range(T):
                 vi0, vi1, vi2 = int(tri[t, 0]), int(tri[t, 1]), int(tri[t, 2])
                 if vi0 < 0 or vi0 >= V or vi1 < 0 or vi1 >= V or vi2 < 0 or vi2 >= V:
@@ -82,7 +82,7 @@ def rasterize_ref(pos, tri, H, W):
                 w = p0[3] * a0 + p1[3] * a1 + p2[3] * a2
                 zw = z / w
 
-                if b0 >= 0 and b1 >= 0 and (b0 + b1) <= 1.0 and zw > best_z:
+                if b0 >= 0 and b1 >= 0 and (b0 + b1) <= 1.0 and zw < best_z:
                     dfxdx = xs * iw
                     dfydy = ys * iw
                     da0dx = p2[1] * p1[3] - p1[1] * p2[3]

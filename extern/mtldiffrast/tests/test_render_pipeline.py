@@ -23,7 +23,7 @@ def float_to_triidx_ref(f):
 
 
 def rasterize_ref(pos, tri, H, W):
-    """CPU reference rasterizer with >= depth test (matches hardware last-write-wins)."""
+    """CPU reference rasterizer matching nvdiffrast: smallest z/w wins, ties keep-first."""
     V = pos.shape[0]
     T = tri.shape[0]
     rast = np.zeros((H, W, 4), dtype=np.float32)
@@ -37,7 +37,7 @@ def rasterize_ref(pos, tri, H, W):
         for px in range(W):
             fx = xs * px + xo
             fy = ys * py + yo
-            best_z = -2.0
+            best_z = 2.0  # far sentinel; nvdiffrast keeps the smallest z/w
             for t in range(T):
                 vi0, vi1, vi2 = int(tri[t, 0]), int(tri[t, 1]), int(tri[t, 2])
                 if vi0 < 0 or vi0 >= V or vi1 < 0 or vi1 >= V or vi2 < 0 or vi2 >= V:
@@ -64,7 +64,7 @@ def rasterize_ref(pos, tri, H, W):
                 w = p0[3] * a0 + p1[3] * a1 + p2[3] * a2
                 zw = z / w
 
-                if b0 >= 0 and b1 >= 0 and (b0 + b1) <= 1.0 and zw >= best_z:
+                if b0 >= 0 and b1 >= 0 and (b0 + b1) <= 1.0 and zw < best_z:
                     cb0 = max(0.0, min(1.0, b0))
                     cb1 = max(0.0, min(1.0, b1))
                     bs = 1.0 / max(cb0 + cb1, 1.0)
@@ -112,7 +112,7 @@ class TestRenderPipeline:
                         assert float_to_triidx_ref(mtl_rast[py, px, 3]) == float_to_triidx_ref(ref[py, px, 3])
 
     def test_depth_test_two_triangles(self):
-        """Closer triangle (higher z/w) should win."""
+        """Closer triangle (smaller z/w) should win — nvdiffrast convention."""
         MtlRasterizeContext, rasterize = self._get_mtl()
         pos = torch.tensor([
             [-0.8, -0.8, 0.3, 1.0],

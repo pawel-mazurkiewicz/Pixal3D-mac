@@ -49,6 +49,11 @@ vertex RasterizerData rasterize_vertex(
 
     float4 pos = positions[vi];
     out.position = pos;
+    // nvdiffrast uses OpenGL clip space (z in [-w, w]); Metal's clip volume is
+    // [0, w].  Remap GL clip z -> Metal clip z so (a) the full NDC z range
+    // [-1, 1] survives near-plane clipping and (b) a smaller z/w (nvdiffrast's
+    // "closer", which must win the depth test) maps to a smaller Metal depth.
+    out.position.z = (pos.z + pos.w) * 0.5f;
     out.triangle_id = tri_id;
 
     return out;
@@ -62,8 +67,9 @@ fragment float4 rasterize_fragment(
 ) {
     float u = barycentrics.x;
     float v = barycentrics.y;
-    // in.position.z is the viewport depth = z_ndc = z_clip/w_clip (viewport [0,1])
-    float zw = in.position.z;
+    // in.position.z is the Metal window depth in [0,1] = (z/w + 1)/2 after the
+    // vertex z-remap.  Recover nvdiffrast's NDC z/w in [-1,1] for the output.
+    float zw = 2.0f * in.position.z - 1.0f;
 
     // Clamp barycentrics to [0, 1]
     u = saturate(u);
@@ -110,7 +116,9 @@ kernel void rasterize_compute_kernel(
     float fy = params.ys * float(py) + params.yo;
 
     // Find closest triangle (simple scan — in practice, use the render pipeline)
-    float best_z = -2.0f;
+    // nvdiffrast keeps the SMALLEST z/w (cudaraster atomicMin); init to the far
+    // sentinel and accept strictly-smaller z/w so ties keep the first triangle.
+    float best_z = 2.0f;
     float best_u = 0, best_v = 0;
     int best_tri = -1;
     float best_dudx = 0, best_dudy = 0, best_dvdx = 0, best_dvdy = 0;
@@ -152,7 +160,7 @@ kernel void rasterize_compute_kernel(
         float zw = z / w;
 
         // Inside triangle check
-        if (u >= 0 && v >= 0 && (u + v) <= 1.0f && zw >= best_z) {
+        if (u >= 0 && v >= 0 && (u + v) <= 1.0f && zw < best_z) {
             best_z = zw;
 
             // Bary pixel differentials — MUST use pre-clamp u,v

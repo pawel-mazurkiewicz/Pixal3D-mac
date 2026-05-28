@@ -49,9 +49,12 @@ void MtlRasterizeContext::setup_render_pipeline() {
     TORCH_CHECK(render_pipeline_ != nil, "[mtldiffrast] Failed to create render pipeline: ",
                 error ? [[error localizedDescription] UTF8String] : "unknown");
 
-    // Depth stencil state: Greater comparison (closest z/w wins)
+    // Depth stencil state: Less comparison — matches nvdiffrast's cudaraster,
+    // which keeps the SMALLEST z/w (atomicMin + "depth > oldDepth -> zkill").
+    // Strict Less (not LessEqual) makes equal-depth fragments keep-first
+    // (draw/triangle order), matching nvdiffrast's deterministic tie-break.
     MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-    dsDesc.depthCompareFunction = MTLCompareFunctionGreaterEqual;
+    dsDesc.depthCompareFunction = MTLCompareFunctionLess;
     dsDesc.depthWriteEnabled = YES;
     depth_stencil_ = [device_ newDepthStencilStateWithDescriptor:dsDesc];
 }
@@ -120,7 +123,7 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
         rpd.depthAttachment.texture = depthTex;
         rpd.depthAttachment.loadAction = MTLLoadActionClear;
         rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
-        rpd.depthAttachment.clearDepth = 0.0;  // All valid z/w >= 0 will pass GreaterEqual
+        rpd.depthAttachment.clearDepth = 1.0;  // far plane; first fragment (depth<1) passes Less
 
         struct {
             int num_triangles;
