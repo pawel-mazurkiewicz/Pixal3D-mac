@@ -172,6 +172,33 @@ with torch.no_grad():
     meshes, subs = pipeline.decode_shape_slat(shape_slat, res)
     info = [{"i": i, "n": int(s.feats.shape[0]), "std": round(float(s.feats.std()), 2)} for i, s in enumerate(subs)]
     print("SUBS_JSON: " + json.dumps(info), flush=True)
+
+    # RAW-mesh PERFORATION metric (pre-bake / pre-simplify): boundary (open)
+    # edges after coord-merge (B_true convention, INVESTIGATION_FACTS §4B). A
+    # perforated/torn surface = high boundary-edge count. Tests whether the
+    # holes are latent/decode-driven (and reduced by recalib) vs bake-introduced.
+    try:
+        import trimesh
+        from trimesh.grouping import group_rows
+        m = meshes[0]
+        V = np.asarray(m.vertices.detach().cpu().numpy() if hasattr(m.vertices, "detach") else m.vertices)
+        F = np.asarray(m.faces.detach().cpu().numpy() if hasattr(m.faces, "detach") else m.faces)
+        tm = trimesh.Trimesh(vertices=V, faces=F, process=False)
+        tm.merge_vertices()  # coord-merge so UV-seam dup verts don't inflate boundary count
+        es = tm.edges_sorted
+        n_unique = len(group_rows(es))
+        n_boundary = len(group_rows(es, require_count=1))  # edges used by exactly 1 face
+        print("MESH_JSON: " + json.dumps({
+            "n_verts": int(len(tm.vertices)), "n_faces": int(len(tm.faces)),
+            "n_unique_edges": int(n_unique),
+            "n_boundary_edges": int(n_boundary),
+            "boundary_frac": round(n_boundary / max(n_unique, 1), 5),
+            "euler": int(tm.euler_number),
+            "watertight": bool(tm.is_watertight),
+        }), flush=True)
+    except Exception as exc:
+        print(f"MESH_JSON: {json.dumps({'error': repr(exc)})}", flush=True)
+
     tex_voxels = pipeline.decode_tex_slat(tex_slat, subs)
     print("TEX_JSON: " + json.dumps(_sat(tex_voxels.feats)), flush=True)
 print("[replay] done", flush=True)
