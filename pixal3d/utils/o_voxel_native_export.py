@@ -245,6 +245,317 @@ def _patch_grid_sample_output(postprocess_module) -> None:
 
 
 
+
+
+def _patch_cleanup_to_noop(postprocess,
+                            *,
+                            fill_holes: bool = False,
+                            repair_nme: bool = False,
+                            small_cc: bool = False,
+                            unify: bool = False,
+                            dedup: bool = False,
+                            degen: bool = False) -> None:
+    """Selectively no-op cleanup ops on `_MeshBackend`.  Back-ported from
+    Pixal3D_fresh/feat/apple-silicon-port-v2 (S17).  Applied AFTER any
+    pre-existing env-var patches (`_patch_repair_non_manifold_edges` etc.)
+    so this wins when both are set."""
+    if not any([fill_holes, repair_nme, small_cc, unify, dedup, degen]):
+        return
+    backend_cls = postprocess._MeshBackend
+    patched = []
+    def _log_skip(op_name, self):
+        print(f"[o_voxel-native]   skip {op_name} (V={self.num_vertices:,} F={self.num_faces:,})", flush=True)
+    if fill_holes:
+        def _noop_fh(self, max_hole_perimeter=3e-2): _log_skip("fill_holes", self)
+        backend_cls.fill_holes = _noop_fh
+        patched.append("fill_holes")
+    if repair_nme:
+        def _noop_rn(self): _log_skip("repair_non_manifold_edges", self)
+        backend_cls.repair_non_manifold_edges = _noop_rn
+        patched.append("repair_nme")
+    if small_cc:
+        def _noop_sc(self, min_area): _log_skip("remove_small_connected_components", self)
+        backend_cls.remove_small_connected_components = _noop_sc
+        patched.append("small_cc")
+    if unify:
+        def _noop_uf(self): _log_skip("unify_face_orientations", self)
+        backend_cls.unify_face_orientations = _noop_uf
+        patched.append("unify")
+    if dedup:
+        def _noop_df(self): _log_skip("remove_duplicate_faces", self)
+        backend_cls.remove_duplicate_faces = _noop_df
+        patched.append("dedup")
+    if degen:
+        def _noop_dg(self, abs_thresh=1e-24, rel_thresh=1e-12): _log_skip("remove_degenerate_faces", self)
+        backend_cls.remove_degenerate_faces = _noop_dg
+        patched.append("degen")
+    print(f"[o_voxel-native] PATCH: selective cleanup-to-noop on {backend_cls.__name__}: {', '.join(patched)}", flush=True)
+
+
+def _patch_simplify_to_noop(postprocess) -> None:
+    """No-op cumesh.simplify (back-ported from S17)."""
+    backend_cls = postprocess._MeshBackend
+    print(f"[o_voxel-native] PATCH: simplify-to-noop on {backend_cls.__name__}", flush=True)
+    def _noop(self, target_num_faces, verbose=False, options=None):
+        print(f"[o_voxel-native]   skip simplify (target={target_num_faces:,}, V={self.num_vertices:,} F={self.num_faces:,})", flush=True)
+    backend_cls.simplify = _noop
+
+
+def _patch_simplify_skip_3x(postprocess) -> None:
+    """S21: Skip only the FIRST simplify call (the destructive `target*3` pass).
+
+    The canonical o_voxel.to_glb chain calls simplify twice:
+      1. simplify(target*3) — intermediate decimation 8M→3M faces
+      2. simplify(target)   — final decimation to target
+
+    On Mac, the first pass amplifies NMEs catastrophically when the raw mesh
+    has even modestly more NMEs than CUDA (6.5% vs 5.1%). Skipping it keeps
+    the topology much cleaner. The second simplify(target) still runs and
+    handles the final decimation on a now-repaired (post-repair_nme) mesh,
+    where it doesn't catastrophically amplify NMEs.
+
+    S21 measurement on fairy fp32 raw: final boundary 21.0% → 7.8%
+    (3.6x reduction in unmatched edges).
+    """
+    backend_cls = postprocess._MeshBackend
+    original = backend_cls.simplify
+    _state = {"call_count": 0}
+    print(f"[o_voxel-native] PATCH: simplify-skip-3x on {backend_cls.__name__} (only the 1st simplify call becomes a no-op)", flush=True)
+    def _wrapped(self, target_num_faces, verbose=False, options=None):
+        n = _state["call_count"]
+        _state["call_count"] += 1
+        if n == 0:
+            print(f"[o_voxel-native]   skip simplify_3x (target={target_num_faces:,}, V={self.num_vertices:,} F={self.num_faces:,}) [S21 swiss-cheese fix]", flush=True)
+            return
+        return original(self, target_num_faces, verbose=verbose, options=options)
+    backend_cls.simplify = _wrapped
+
+
+def _patch_small_cc_threshold(postprocess, threshold: float) -> None:
+    """Override min_area for remove_small_connected_components (back-ported from S17).
+    No effect if cleanup_to_noop already patched small_cc to no-op."""
+    backend_cls = postprocess._MeshBackend
+    original = backend_cls.remove_small_connected_components
+    def _override(self, min_area):
+        print(f"[o_voxel-native]   override small_cc threshold {min_area} -> {threshold} (V={self.num_vertices:,} F={self.num_faces:,})", flush=True)
+        return original(self, threshold)
+    backend_cls.remove_small_connected_components = _override
+    print(f"[o_voxel-native] PATCH: small_cc threshold override -> {threshold} on {backend_cls.__name__}", flush=True)
+
+
+def _patch_presmooth_for_compute_charts(postprocess, mode: str, iterations: int) -> None:
+    """Smooth mesh vertices right before compute_charts (S17b).
+
+    Diagnostic chain established:
+    - Raw post-extract mesh: ~9 faces/chart (good local-normal coherence)
+    - Post-QEM-simplify (any simplifier): ~1-3 faces/chart (QEM perturbs the
+      normals of faces sharing the moved vertex)
+    - Compute_charts can't merge a mesh where neighboring face normals
+      differ by >cone-threshold
+
+    This patch wraps ``_MeshBackend.compute_charts`` to first apply Taubin
+    (or Laplacian/Humphrey) smoothing on the mesh vertices, healing the
+    per-face normal perturbations.  Volume-preserving Taubin recommended;
+    Laplacian shrinks the mesh, Humphrey is in between.
+    """
+    if mode == "none":
+        return
+    backend_cls = postprocess._MeshBackend
+    original = backend_cls.compute_charts
+    import trimesh as _tm
+    import torch as _torch
+    import numpy as _np
+
+    def _wrapped(self, *args, **kwargs):
+        verts, faces = self.read()
+        verts_np = verts.detach().cpu().numpy().astype(_np.float64, copy=False)
+        faces_np = faces.detach().cpu().numpy().astype(_np.int64, copy=False)
+        mesh = _tm.Trimesh(vertices=verts_np, faces=faces_np, process=False)
+
+        # Identify "safe" vertices: those touching only manifold edges (shared by exactly 2 faces).
+        # NME vertices (touched by edges with face_count != 2) cause Taubin's Laplacian to
+        # yank them into shrapnel spikes; we freeze them at their original positions.
+        edges_unique = mesh.edges_unique
+        edge_face_count = _np.bincount(mesh.edges_unique_inverse,
+                                        minlength=len(edges_unique))
+        nme_edge_mask = edge_face_count != 2
+        if nme_edge_mask.any():
+            nme_vertices = _np.unique(edges_unique[nme_edge_mask].flatten())
+        else:
+            nme_vertices = _np.array([], dtype=_np.int64)
+        n_safe = len(verts_np) - len(nme_vertices)
+        n_total = len(verts_np)
+        print(
+            f"[o_voxel-native]   precharts-smooth: {mode}, iters={iterations}, "
+            f"V={n_total:,} F={faces_np.shape[0]:,}, "
+            f"freezing {len(nme_vertices):,} NME vertices ({100.0*len(nme_vertices)/max(n_total,1):.1f}%)",
+            flush=True,
+        )
+
+        # Run smoothing one iteration at a time, snapping NME vertices back each time
+        # so they can't propagate displacement to neighbors via Laplacian.
+        original_verts = verts_np.copy()
+        for it in range(iterations):
+            if mode == "taubin":
+                _tm.smoothing.filter_taubin(mesh, iterations=1)
+            elif mode == "laplacian":
+                _tm.smoothing.filter_laplacian(mesh, iterations=1)
+            elif mode == "humphrey":
+                _tm.smoothing.filter_humphrey(mesh, iterations=1)
+            else:
+                raise ValueError(f"unknown smoothing mode: {mode}")
+            if len(nme_vertices) > 0:
+                mesh.vertices[nme_vertices] = original_verts[nme_vertices]
+
+        # Sanity check: report max displacement of safe vertices
+        displacement = _np.linalg.norm(mesh.vertices - original_verts, axis=1)
+        bbox_diag = float(_np.linalg.norm(original_verts.max(axis=0) - original_verts.min(axis=0)))
+        print(
+            f"[o_voxel-native]   smoothed: max displacement {displacement.max():.4f} "
+            f"({100.0*displacement.max()/max(bbox_diag,1e-9):.2f}% of bbox diag), "
+            f"mean {displacement.mean():.4f}",
+            flush=True,
+        )
+
+        new_verts_t = _torch.from_numpy(mesh.vertices.astype(_np.float32)).contiguous()
+        new_faces_t = _torch.from_numpy(faces_np.astype(_np.int32)).contiguous()
+        self.init(new_verts_t, new_faces_t)
+        return original(self, *args, **kwargs)
+
+    backend_cls.compute_charts = _wrapped
+    print(
+        f"[o_voxel-native] PATCH: precharts-smooth on {backend_cls.__name__} "
+        f"(mode={mode}, iters={iterations})",
+        flush=True,
+    )
+
+
+def _patch_simplify_fast(postprocess) -> None:
+    """Replace ``_MeshBackend.simplify`` with ``fast_simplification`` (S17b).
+
+    Bisection result: Pedro's Metal simplify produces a mesh whose
+    per-triangle normal noise defeats compute_charts.  Same mesh handed to
+    CUDA compute_charts → 557k charts (vs CUDA-simplified-mesh → ~hundreds).
+    fast_simplification is a mature QEM C++ library, already on disk for the
+    macOS CPU fallback path (postprocess_cpu.py).  This swap lets us test
+    whether replacing the simplifier alone fixes chart-count blowup.
+    """
+    try:
+        import fast_simplification
+    except ImportError as exc:
+        raise RuntimeError(
+            "fast_simplification not installed in the bridge venv; "
+            "pip install fast-simplification"
+        ) from exc
+    backend_cls = postprocess._MeshBackend
+    import numpy as _np
+    import torch as _torch
+
+    def _simplify_fast(self, target_num_faces, verbose=False, options=None):
+        verts, faces = self.read()
+        verts_np = verts.detach().cpu().numpy().astype(_np.float64, copy=False)
+        faces_np = faces.detach().cpu().numpy().astype(_np.int32, copy=False)
+        num_faces = faces_np.shape[0]
+        if num_faces <= target_num_faces:
+            if verbose:
+                print(f"[o_voxel-native]   simplify(fast): F={num_faces:,} already <= target={target_num_faces:,}, no-op", flush=True)
+            return
+        target_reduction = 1.0 - (target_num_faces / num_faces)
+        if verbose:
+            print(f"[o_voxel-native]   simplify(fast): F={num_faces:,} -> target={target_num_faces:,} (reduction={target_reduction:.3f})", flush=True)
+        new_verts, new_faces = fast_simplification.simplify(
+            verts_np, faces_np,
+            target_reduction=target_reduction,
+        )
+        new_verts_t = _torch.from_numpy(new_verts.astype(_np.float32)).contiguous()
+        new_faces_t = _torch.from_numpy(new_faces.astype(_np.int32)).contiguous()
+        self.init(new_verts_t, new_faces_t)
+        if verbose:
+            print(f"[o_voxel-native]   simplify(fast): result V={new_verts.shape[0]:,} F={new_faces.shape[0]:,}", flush=True)
+
+    backend_cls.simplify = _simplify_fast
+    print(f"[o_voxel-native] PATCH: simplify swapped to fast_simplification on {backend_cls.__name__}", flush=True)
+
+
+def _patch_compute_charts(postprocess,
+                           *,
+                           save_input_path: str = None,
+                           area_weight: float = None,
+                           perim_weight: float = None) -> None:
+    """Wrap ``_MeshBackend.compute_charts`` for S17b bisection of the
+    "Mac gets 687k charts vs CUDA's hundreds" problem.
+
+    - ``save_input_path``: dump the exact mesh state + kwargs handed to
+      compute_charts as a .npz, so it can be shipped to a CUDA box and
+      run through ``cumesh.compute_charts`` there.  Lets us bisect whether
+      the chart blowup is in Pedro's Metal port of compute_charts or in
+      the upstream Metal simplify producing a noisier-normal mesh.
+    - ``area_weight`` / ``perim_weight``: override the area_penalty_weight
+      (CUDA default 0.1) and perimeter_area_ratio_weight (CUDA default
+      0.0001) kwargs that o_voxel never plumbs through.  Setting to 0
+      disables the area/perim penalties so the cone-cost is the only
+      term, which is the most aggressive merge configuration the
+      algorithm allows.
+    """
+    if save_input_path is None and area_weight is None and perim_weight is None:
+        return
+    backend_cls = postprocess._MeshBackend
+    original = backend_cls.compute_charts
+    import numpy as _np
+    import torch as _torch
+
+    def _wrapped(self, *args, **kwargs):
+        if save_input_path is not None:
+            verts, faces = self.read()
+            verts_np = verts.detach().cpu().numpy()
+            faces_np = faces.detach().cpu().numpy()
+            saved_kwargs = dict(kwargs)
+            # positional → named (compute_charts signature):
+            # (threshold_cone_half_angle_rad, refine_iterations, global_iterations,
+            #  smooth_strength, area_penalty_weight, perimeter_area_ratio_weight)
+            arg_names = [
+                "threshold_cone_half_angle_rad", "refine_iterations",
+                "global_iterations", "smooth_strength",
+                "area_penalty_weight", "perimeter_area_ratio_weight",
+            ]
+            for i, val in enumerate(args):
+                if i < len(arg_names):
+                    saved_kwargs[arg_names[i]] = val
+            _np.savez_compressed(
+                save_input_path,
+                vertices=verts_np.astype(_np.float32),
+                faces=faces_np.astype(_np.int32),
+                **{f"kw_{k}": _np.asarray(v) for k, v in saved_kwargs.items()},
+            )
+            print(
+                f"[o_voxel-native] saved compute_charts input -> {save_input_path} "
+                f"(V={verts_np.shape[0]:,} F={faces_np.shape[0]:,}, kwargs={saved_kwargs})",
+                flush=True,
+            )
+        if area_weight is not None:
+            kwargs["area_penalty_weight"] = area_weight
+        if perim_weight is not None:
+            kwargs["perimeter_area_ratio_weight"] = perim_weight
+        if area_weight is not None or perim_weight is not None:
+            print(
+                f"[o_voxel-native]   compute_charts kwargs override: "
+                f"area_w={kwargs.get('area_penalty_weight', '<default>')} "
+                f"perim_w={kwargs.get('perimeter_area_ratio_weight', '<default>')}",
+                flush=True,
+            )
+        return original(self, *args, **kwargs)
+
+    backend_cls.compute_charts = _wrapped
+    flags = []
+    if save_input_path is not None:
+        flags.append(f"save_input={save_input_path}")
+    if area_weight is not None:
+        flags.append(f"area_w={area_weight}")
+    if perim_weight is not None:
+        flags.append(f"perim_w={perim_weight}")
+    print(f"[o_voxel-native] PATCH: compute_charts wrapped on {backend_cls.__name__} ({', '.join(flags)})", flush=True)
+
+
 def _load_cumesh_port_module(filename: str):
     """Load a single ``cumesh_port`` submodule by path, bypassing __init__.py.
 
@@ -298,16 +609,33 @@ def _patch_repair_non_manifold_edges(postprocess_module) -> None:
         return
 
     # Session 7: PIXAL3D_REPAIR_NME=metal opts into Pedro's mtlmesh
-    # repair_non_manifold_edges.  The previous diagnosis (Metal over-splits
-    # ~3x) was empirically supported but may be a symptom of pamo's bad
-    # collapses producing extra NMEs in the first place.  With Metal
-    # simplify producing far fewer NMEs (session-7 observation: +19K
-    # inflation instead of +2.5M), it's worth testing the native Metal
-    # repair as well.  Default remains CPU port for safe rollback.
-    if os.environ.get("PIXAL3D_REPAIR_NME", "").strip().lower() == "metal":
+    # repair_non_manifold_edges.  Metal simplify produces far fewer NMEs
+    # (session-7: +19K inflation instead of +2.5M).
+    # Session 15: Metal is now the default (Metal cleanup chain validated
+    # end-to-end via CUDA-mesh-through-Mac-cleanup exoneration test).
+    # Session 16: noop diagnostic added — proved Mac's split breaks
+    # edge-pair invariants vs CUDA's split.  PIXAL3D_REPAIR_NME=pamo opts
+    # out to the CPU port for safe rollback; PIXAL3D_REPAIR_NME=noop skips
+    # the call entirely (diagnostic).
+    setting = os.environ.get("PIXAL3D_REPAIR_NME", "metal").strip().lower()
+
+    if setting == "noop":
+        def _noop_repair_nme(self):
+            print(
+                f"[o_voxel-native] skipping repair_non_manifold_edges "
+                f"[V={self.num_vertices:,} F={self.num_faces:,}]",
+                flush=True,
+            )
+        MeshBackend.repair_non_manifold_edges = _noop_repair_nme
+        MeshBackend._repair_nme_patched = True
+        print("[o_voxel-native] _MeshBackend.repair_non_manifold_edges "
+              "patched (PIXAL3D_REPAIR_NME=noop)", flush=True)
+        return
+
+    if setting != "pamo":
         print(
-            "[o_voxel-native] PIXAL3D_REPAIR_NME=metal — keeping native "
-            "cumesh.CuMesh.repair_non_manifold_edges (mtlmesh)",
+            "[o_voxel-native] PIXAL3D_REPAIR_NME default (metal) — keeping "
+            "native cumesh.CuMesh.repair_non_manifold_edges (mtlmesh)",
             flush=True,
         )
         MeshBackend._repair_nme_patched = True  # idempotent across calls
@@ -487,9 +815,11 @@ def _patch_unify_face_orientations(postprocess_module) -> None:
     if MeshBackend is None or getattr(MeshBackend, "_unify_patched", False):
         return
 
-    if os.environ.get("PIXAL3D_UNIFY_FACE_ORIENTATIONS", "").strip().lower() == "metal":
-        print("[o_voxel-native] PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal; "
-              "keeping native Metal unify_face_orientations (buggy)",
+    # Session 15: Metal is now the default; PIXAL3D_UNIFY_FACE_ORIENTATIONS=pamo
+    # opts out to the CPU port.
+    if os.environ.get("PIXAL3D_UNIFY_FACE_ORIENTATIONS", "metal").strip().lower() != "pamo":
+        print("[o_voxel-native] PIXAL3D_UNIFY_FACE_ORIENTATIONS default (metal); "
+              "keeping native Metal unify_face_orientations",
               flush=True)
         return
 
@@ -661,8 +991,10 @@ def _patch_simplify(postprocess_module) -> None:
     # confirmed simplify.metal:56 carries the winding-flip-reject check
     # faithfully from CUDA simplify.cu:127-129, refuting the earlier
     # "Metal port skips the check" diagnosis that motivated this pamo patch.
-    # Default remains pamo for safe rollback; flip default after validation.
-    backend = os.environ.get("PIXAL3D_SIMPLIFY", "pamo").lower()
+    # Session 15: Metal is now the default (validated end-to-end via CUDA-
+    # mesh-through-Mac-cleanup exoneration test).  PIXAL3D_SIMPLIFY=pamo
+    # opts out to the CPU pamo port for safe rollback / debugging.
+    backend = os.environ.get("PIXAL3D_SIMPLIFY", "metal").lower()
     if backend == "metal":
         print(
             "[o_voxel-native] PIXAL3D_SIMPLIFY=metal — keeping native "
@@ -826,7 +1158,7 @@ def _load_npz(path: Path):
     return vertices, faces, attrs, coords, aabb, resolution
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Export a Pixal3D mesh NPZ with native o_voxel")
     parser.add_argument("--input", required=True, help="Raw mesh/voxel NPZ")
     parser.add_argument("--output", required=True, help="Output GLB path")
@@ -854,11 +1186,47 @@ def parse_args():
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--no-tqdm", action="store_true")
-    return parser.parse_args()
+    # ---- S17 back-port: selective cleanup skip + thresholds ----
+    parser.add_argument("--skip-cleanup", action="store_true",
+                        help="No-op all 6 cleanup ops (fill_holes/repair_nme/small_cc/unify/dedup/degen).")
+    parser.add_argument("--skip-fill-holes", action="store_true")
+    parser.add_argument("--skip-repair-nme", action="store_true")
+    parser.add_argument("--skip-small-cc", action="store_true")
+    parser.add_argument("--skip-unify", action="store_true")
+    parser.add_argument("--skip-dedup", action="store_true")
+    parser.add_argument("--skip-degen", action="store_true")
+    parser.add_argument("--skip-simplify", action="store_true",
+                        help="No-op cumesh.simplify (risky on multi-M-face meshes).")
+    parser.add_argument("--skip-simplify-3x", action="store_true",
+                        help="S21: skip only the destructive intermediate simplify(target*3) pass; "
+                             "keep the final simplify(target). Cuts swiss-cheese boundary edges ~3x "
+                             "on Mac MPS raw meshes by avoiding NME amplification on dense thin walls.")
+    parser.add_argument("--small-cc-threshold", type=float, default=None,
+                        help="Override min_area for remove_small_connected_components.  Try 1e-7.")
+    parser.add_argument("--fill-holes-perimeter", type=float, default=None,
+                        help="Override max_hole_perimeter for all fill_holes calls in o_voxel.to_glb.")
+    parser.add_argument("--simplify-impl", choices=["metal", "fast"], default="metal",
+                        help="Simplifier: 'metal' = Pedro's port (cumesh.simplify, default); "
+                             "'fast' = fast_simplification (CPU QEM) — S17b test for compute_charts "
+                             "chart-count blowup root cause.")
+    # ---- S17b: compute_charts bisection + knob overrides ----
+    parser.add_argument("--save-compute-charts-input", type=str, default=None,
+                        help="Dump (vertices, faces, kwargs) handed to compute_charts to this .npz, "
+                             "for cross-platform bisection (run on CUDA via scripts/cuda_compute_charts_test.py).")
+    parser.add_argument("--compute-charts-area-weight", type=float, default=None,
+                        help="Override area_penalty_weight kwarg to compute_charts (cumesh default 0.1; set 0 to disable).")
+    parser.add_argument("--compute-charts-perim-weight", type=float, default=None,
+                        help="Override perimeter_area_ratio_weight kwarg to compute_charts (cumesh default 0.0001; set 0 to disable).")
+    parser.add_argument("--precharts-smooth", choices=["none", "laplacian", "taubin", "humphrey"], default="none",
+                        help="Smooth mesh vertices right before compute_charts to heal QEM-induced "
+                             "per-face normal perturbations (S17b root-cause fix).")
+    parser.add_argument("--precharts-smooth-iterations", type=int, default=5,
+                        help="Smoothing iterations (default 5).")
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv=None) -> int:
+    args = parse_args(argv)
     os.environ.setdefault(
         "FLEX_GEMM_AUTOTUNE_CACHE_PATH",
         str(Path(args.output).resolve().parent / "autotune_cache.json"),
@@ -871,8 +1239,42 @@ def main() -> int:
     _patch_repair_non_manifold_edges(postprocess)
     _patch_remove_small_connected_components(postprocess)  # opt-in via PIXAL3D_SMALL_CC
     _patch_simplify(postprocess)
+    if args.fill_holes_perimeter is not None:
+        os.environ["PIXAL3D_FILL_HOLES_PERIMETER"] = str(args.fill_holes_perimeter)
     _patch_fill_holes(postprocess)  # opt-in via PIXAL3D_FILL_HOLES_PERIMETER
     _patch_unify_face_orientations(postprocess)  # default on; opt out via PIXAL3D_UNIFY_FACE_ORIENTATIONS=metal
+    # ---- S17 back-port: selective cleanup-to-noop overrides ----
+    _patch_cleanup_to_noop(
+        postprocess,
+        fill_holes=args.skip_cleanup or args.skip_fill_holes,
+        repair_nme=args.skip_cleanup or args.skip_repair_nme,
+        small_cc=args.skip_cleanup or args.skip_small_cc,
+        unify=args.skip_cleanup or args.skip_unify,
+        dedup=args.skip_cleanup or args.skip_dedup,
+        degen=args.skip_cleanup or args.skip_degen,
+    )
+    if args.skip_simplify:
+        _patch_simplify_to_noop(postprocess)
+    elif getattr(args, "skip_simplify_3x", False):
+        _patch_simplify_skip_3x(postprocess)
+    elif args.simplify_impl == "fast":
+        _patch_simplify_fast(postprocess)
+    if args.small_cc_threshold is not None and not (args.skip_cleanup or args.skip_small_cc):
+        _patch_small_cc_threshold(postprocess, args.small_cc_threshold)
+    # ---- S17b: compute_charts bisection + knob overrides ----
+    _patch_compute_charts(
+        postprocess,
+        save_input_path=args.save_compute_charts_input,
+        area_weight=args.compute_charts_area_weight,
+        perim_weight=args.compute_charts_perim_weight,
+    )
+    # Apply smoothing patch AFTER compute_charts patch so smoothing happens
+    # FIRST in call order (mesh is smoothed, then saved, then compute_charts runs).
+    _patch_presmooth_for_compute_charts(
+        postprocess,
+        mode=args.precharts_smooth,
+        iterations=args.precharts_smooth_iterations,
+    )
 
     vertices, faces, attrs, coords, aabb, resolution = _load_npz(Path(args.input))
     if args.verbose:

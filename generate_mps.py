@@ -88,6 +88,258 @@ def _dump_fixture(name: str, payload, fixture_dir: str | None = None):
         sys.exit(0)
 
 
+def _parse_csv_env(name: str) -> set[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return set()
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {
+        "1", "true", "yes", "on", "full", "sample", "samples",
+        "summary", "trace",
+    }
+
+
+def _safe_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        print(f"[fixture] WARN: {name}={raw!r} is not an int; using {default}.",
+              flush=True)
+        return default
+
+
+def _sanitize_fixture_part(s: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+
+
+def _tensor_trace_payload(name: str, x, *, sample_count: int,
+                          include_full: bool) -> dict:
+    """Compact, diffable tensor capture for large NAF internals.
+
+    Full NAF maps are often hundreds of MB to several GB.  The default payload
+    stores shape/dtype/device, scalar stats, and deterministic flat samples.
+    Selective full tensor dumps are opt-in via PIXAL3D_NAF_TRACE_FULL.
+    """
+    payload = {
+        "name": name,
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "device": str(x.device),
+        "numel": int(x.numel()),
+        "sample_count_requested": int(sample_count),
+    }
+    if x.numel() == 0:
+        payload["samples"] = {"indices": torch.empty(0, dtype=torch.long),
+                              "values": torch.empty(0)}
+        if include_full:
+            payload["full"] = x.detach()
+        return payload
+
+    with torch.no_grad():
+        xd = x.detach()
+        try:
+            xf = xd.float() if xd.dtype not in (
+                torch.float64, torch.float32,
+            ) else xd
+            payload["summary"] = {
+                "mean": float(xf.mean().item()),
+                "std": float(xf.std(unbiased=False).item()),
+                "min": float(xf.min().item()),
+                "max": float(xf.max().item()),
+                "l2": float(torch.linalg.vector_norm(xf).item()),
+            }
+        except Exception as exc:
+            payload["summary_error"] = repr(exc)
+
+        n = min(sample_count, int(xd.numel()))
+        try:
+            sample_idx_cpu = torch.linspace(
+                0, int(xd.numel()) - 1, steps=n, dtype=torch.float64,
+                device="cpu",
+            ).round().to(torch.long)
+            # Avoid flattening with reshape: many NAF tensors are permuted
+            # heads-last views, and flattening them can materialize multi-GB
+            # contiguous copies.  Unravel on CPU, then advanced-index only
+            # the small deterministic sample set on the tensor's device.
+            coords_cpu = torch.unravel_index(sample_idx_cpu, tuple(xd.shape))
+            coords_dev = tuple(c.to(xd.device) for c in coords_cpu)
+            sample_values = xd[coords_dev].detach().cpu()
+            payload["samples"] = {
+                "indices": sample_idx_cpu,
+                "values": sample_values,
+            }
+            if sample_values.is_floating_point():
+                payload["sample_finite"] = bool(
+                    torch.isfinite(sample_values).all().item()
+                )
+        except Exception as exc:
+            payload["sample_error"] = repr(exc)
+
+        if include_full:
+            payload["full"] = xd
+    return payload
+
+
+def _install_naf_trace_hooks(naf_model, *, stage_name: str,
+                             fixture_dir: str) -> bool:
+    """Install low-bandwidth NAF internals capture hooks.
+
+    Enabled with PIXAL3D_NAF_TRACE=1.  By default every captured tensor is
+    stored as stats + deterministic samples.  Use PIXAL3D_NAF_TRACE_FULL as a
+    comma-separated set of label substrings to dump selected full tensors, or
+    PIXAL3D_NAF_TRACE=full to dump everything.
+    """
+    if not _env_flag("PIXAL3D_NAF_TRACE"):
+        return False
+    if getattr(naf_model, "_pixal3d_naf_trace_installed", False):
+        return False
+    if torch is None:
+        return False
+
+    import functools
+    import types
+    import torch.nn as nn
+
+    sample_count = _safe_int_env("PIXAL3D_NAF_TRACE_SAMPLES", 4096)
+    full_mode = os.environ.get("PIXAL3D_NAF_TRACE", "").strip().lower() == "full"
+    full_selectors = _parse_csv_env("PIXAL3D_NAF_TRACE_FULL")
+    dump_counts: dict[str, int] = {}
+
+    def wants_full(label: str) -> bool:
+        if full_mode:
+            return True
+        lower = label.lower()
+        return any(sel in lower for sel in full_selectors)
+
+    def dump(label: str, value) -> None:
+        if not torch.is_tensor(value):
+            return
+        safe_label = _sanitize_fixture_part(label)
+        idx = dump_counts.get(safe_label, 0)
+        dump_counts[safe_label] = idx + 1
+        tag = f"{stage_name}_naf_{safe_label}"
+        if idx:
+            tag = f"{tag}_call{idx}"
+        payload = _tensor_trace_payload(
+            f"{stage_name}.naf.{label}",
+            value,
+            sample_count=sample_count,
+            include_full=wants_full(label),
+        )
+        _dump_fixture(tag, payload, fixture_dir=fixture_dir)
+
+    def hook_output(label: str):
+        def _hook(_module, _args, output):
+            if torch.is_tensor(output):
+                dump(label, output)
+            elif isinstance(output, (list, tuple)):
+                for i, item in enumerate(output):
+                    dump(f"{label}.out{i}", item)
+        return _hook
+
+    def hook_input_output(label: str):
+        def _hook(_module, args, output):
+            if args:
+                dump(f"{label}.input", args[0])
+            if torch.is_tensor(output):
+                dump(f"{label}.output", output)
+        return _hook
+
+    # Per-op hooks: this captures the Conv/GN/SiLU chain where Session 11
+    # localized the q/k divergence.  SiLU modules are reused twice per block,
+    # so dump() call suffixes distinguish activation-after-norm1/norm2.
+    hooked = 0
+    for name, module in naf_model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.GroupNorm, nn.SiLU)):
+            module.register_forward_hook(hook_output(name))
+            hooked += 1
+        elif name in {
+            "image_encoder.encoder",
+            "image_encoder.sem_encoder",
+            "image_encoder.rope",
+            "query_encoder",
+            "key_encoder",
+        }:
+            module.register_forward_hook(hook_input_output(name))
+            hooked += 1
+
+    # Preserve the exact upstream forward_encoder semantics while exposing
+    # concat-before-pool and post-pool boundaries that are otherwise invisible
+    # to module-level hooks.
+    image_encoder = getattr(naf_model, "image_encoder", None)
+    if image_encoder is not None and not getattr(
+        image_encoder, "_pixal3d_trace_wrapped", False
+    ):
+        orig_forward_encoder = image_encoder.forward_encoder
+
+        @functools.wraps(orig_forward_encoder)
+        def wrapped_forward_encoder(self, x, output_size):
+            dump("image_encoder.forward_encoder.input", x)
+            if getattr(self, "use_encoder", False):
+                x = torch.cat([self.encoder(x), self.sem_encoder(x)], dim=1)
+                dump("image_encoder.forward_encoder.concat", x)
+            import torch.nn.functional as F
+            x = F.adaptive_avg_pool2d(x, output_size=output_size)
+            dump("image_encoder.forward_encoder.pooled", x)
+            return x
+
+        image_encoder.forward_encoder = types.MethodType(
+            wrapped_forward_encoder, image_encoder
+        )
+        image_encoder._pixal3d_trace_wrapped = True
+
+    # CrossAttention._resize is where k and v become the actual heads-last
+    # tensors passed into natten.  Wrap it instead of recomputing the resize in
+    # a diagnostic path, because v at 1024² can exceed 4 GB.
+    upsampler = getattr(naf_model, "upsampler", None)
+    if upsampler is not None and not getattr(
+        upsampler, "_pixal3d_trace_wrapped", False
+    ):
+        resize_counter = {"n": 0}
+        orig_resize = upsampler._resize
+
+        @functools.wraps(orig_resize)
+        def wrapped_resize(self, x, size, dtype):
+            out = orig_resize(x, size, dtype)
+            idx = resize_counter["n"]
+            resize_counter["n"] = idx + 1
+            kind = "k" if idx % 2 == 0 else "v"
+            dump(f"upsampler.resize_{kind}.input", x)
+            dump(f"upsampler.resize_{kind}.output_heads_last", out)
+            return out
+
+        def _upsampler_pre_hook(_module, args):
+            resize_counter["n"] = 0
+            if len(args) >= 1:
+                dump("upsampler.forward.q_raw", args[0])
+            if len(args) >= 2:
+                dump("upsampler.forward.k_raw", args[1])
+            if len(args) >= 3:
+                dump("upsampler.forward.v_raw", args[2])
+
+        upsampler._resize = types.MethodType(wrapped_resize, upsampler)
+        upsampler.register_forward_pre_hook(_upsampler_pre_hook)
+        upsampler.register_forward_hook(hook_output("upsampler.forward.output"))
+        upsampler._pixal3d_trace_wrapped = True
+
+    naf_model._pixal3d_naf_trace_installed = True
+    print(f"[fixture] NAF trace hooks installed for {stage_name} "
+          f"({hooked} module hooks, samples={sample_count}, "
+          f"full={'all' if full_mode else sorted(full_selectors) or 'none'})",
+          flush=True)
+    return True
+
+
 def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
     """Monkey-patch pipeline stage methods to dump outputs after each call."""
     import functools
@@ -160,6 +412,23 @@ def _install_pipeline_fixture_hooks(pipeline, fixture_dir: str) -> None:
             print(f"[fixture] WARN: cannot hook {attr}: {exc}", flush=True)
     print(f"[fixture] image_cond_model hooks installed ({image_cond_installed}/4)",
           flush=True)
+
+    naf_trace_installed = 0
+    for fname, attr in image_cond_models:
+        model = getattr(pipeline, attr, None)
+        naf_model = getattr(model, "naf_model", None) if model is not None else None
+        if naf_model is None:
+            continue
+        try:
+            if _install_naf_trace_hooks(naf_model, stage_name=fname,
+                                        fixture_dir=fixture_dir):
+                naf_trace_installed += 1
+        except Exception as exc:
+            print(f"[fixture] WARN: cannot install NAF trace for {attr}: {exc}",
+                  flush=True)
+    if _env_flag("PIXAL3D_NAF_TRACE"):
+        print(f"[fixture] NAF trace hooks installed ({naf_trace_installed}/3)",
+              flush=True)
 
     # --- per-step sampler dumps -------------------------------------------
     # Monkey-patch FlowEulerSampler.sample (the base method that the CFG and
@@ -271,7 +540,9 @@ def _dump_run_metadata(fixture_dir: str, *, image_path: str, args_dict: dict,
         "python_version": platform.python_version(),
         "env": {k: os.environ.get(k) for k in [
             "ATTN_BACKEND", "SPARSE_CONV_BACKEND", "SPARSE_ATTN_BACKEND",
-            "PIXAL3D_DUMP_FIXTURES",
+            "PIXAL3D_DUMP_FIXTURES", "PIXAL3D_NAF_TRACE",
+            "PIXAL3D_NAF_TRACE_SAMPLES", "PIXAL3D_NAF_TRACE_FULL",
+            "NATTEN_MPS_CAPTURE_FIRST",
         ] if os.environ.get(k) is not None},
     }
     out = os.path.join(fixture_dir, "00_metadata.json")
@@ -372,24 +643,21 @@ def load_runtime_deps():
     EXPORT_ROTATION = np.array(EXPORT_ROTATION_ROWS, dtype=np.float64)
 
     # ---- natten dispatch backend selection ----
-    # PIXAL3D_NATTEN_MPS_ENABLE=1 -> route natten.na2d on MPS tensors to
-    # our in-tree Metal kernels (natten-mps).  Validated against CUDA
-    # cutlass-fna at NAF's production shapes to ~1e-3 rel — see
-    # natten-mps/tests/test_cuda_golden.py.
-    # Default                     -> fall back to the pure-PyTorch
-    # _torch_na2d implementation below (slow but bulletproof, was the
-    # source of the 2.5e-2 z_proj RED that spawned this port).
+    # Strategy (Session 15):
+    #   1. ALWAYS define _torch_na2d (pure-PyTorch, supports K-dim != V-dim
+    #      which NAF needs).  This is the bulletproof fallback.
+    #   2. By default, try the community natten-mps Metal kernels via the
+    #      v020 compat shim ( https://github.com/ssmall256/natten-mps ).
+    #      Per-call, if the community kernel rejects the shape (e.g. its
+    #      v020 path requires K-dim == V-dim and NAF passes K=64/V=256),
+    #      transparently fall back to _torch_na2d for that call.
+    #   3. PIXAL3D_NATTEN_MPS=pytorch forces _torch_na2d everywhere
+    #      (skip the community pkg entirely).
+    #   4. PIXAL3D_NATTEN_MPS_ENABLE=1 is the legacy opt-in alias (still
+    #      honoured for back-compat with pre-S15 invocations).
+    _natten_choice = os.environ.get("PIXAL3D_NATTEN_MPS", "metal").strip().lower()
     if os.environ.get("PIXAL3D_NATTEN_MPS_ENABLE", "").strip() == "1":
-        try:
-            import natten_mps as _natten_mps  # noqa: F401  installs shim
-            print("[Pixal3D] natten-mps Metal dispatch active "
-                  f"(version {getattr(_natten_mps, '__version__', '?')})",
-                  flush=True)
-            return  # skip the pure-PyTorch fallback below
-        except ImportError as _exc:
-            print(f"[Pixal3D] WARN: PIXAL3D_NATTEN_MPS_ENABLE=1 set but "
-                  f"natten_mps not importable: {_exc} — falling back to "
-                  f"pure-PyTorch _torch_na2d.", flush=True)
+        _natten_choice = "metal"  # legacy override
 
     # Patch NATTEN's na2d before torch.hub.load loads the NAF upsampler.
     # The hub-cached attentions.py hardcodes backend="cutlass-fna" which in
@@ -473,10 +741,44 @@ def load_runtime_deps():
 
             return out.reshape(B, N, H, W, Dv).permute(0, 2, 3, 1, 4).contiguous()
 
-        _natten.na2d = _torch_na2d
+        # Decide final na2d binding.  If community natten-mps is available
+        # AND user hasn't opted out, install a shim that tries it per-call
+        # and falls back to _torch_na2d for unsupported shapes (e.g. NAF's
+        # K-dim != V-dim which the v020 compat shim rejects).
+        _na2d_final = _torch_na2d
+        if _natten_choice != "pytorch":
+            try:
+                import natten_mps as _natten_mps_pkg
+                from natten_mps.compat import v020 as _natten_mps_v020
+                _community_na2d = _natten_mps_v020.na2d
+
+                def _na2d_community_or_fallback(*args, **kwargs):
+                    kwargs.pop("backend", None)  # v021 -> v020 kwarg shim
+                    try:
+                        return _community_na2d(*args, **kwargs)
+                    except (ValueError, NotImplementedError, TypeError, RuntimeError) as exc:
+                        if not getattr(_na2d_community_or_fallback,
+                                       "_fallback_warned", False):
+                            print(f"[Pixal3D] natten-mps community kernel "
+                                  f"rejected this shape ({type(exc).__name__}: "
+                                  f"{exc}); falling back to pure-PyTorch "
+                                  f"_torch_na2d for matching shapes", flush=True)
+                            _na2d_community_or_fallback._fallback_warned = True
+                        return _torch_na2d(*args, **kwargs)
+
+                _na2d_final = _na2d_community_or_fallback
+                print(f"[Pixal3D] natten-mps Metal dispatch active via "
+                      f"natten_mps.compat.v020 (community pkg "
+                      f"v{getattr(_natten_mps_pkg, '__version__', '?')}) "
+                      f"+ _torch_na2d per-call fallback", flush=True)
+            except ImportError as _exc:
+                print(f"[Pixal3D] natten_mps community pkg not importable "
+                      f"({_exc}); using pure-PyTorch _torch_na2d", flush=True)
+
+        _natten.na2d = _na2d_final
         import natten.functional as _nf
         if hasattr(_nf, "na2d"):
-            _nf.na2d = _torch_na2d
+            _nf.na2d = _na2d_final
     except (ImportError, AttributeError):
         pass  # natten not installed; NAF model will fail gracefully later
 
@@ -535,6 +837,166 @@ def init_pipeline(model_path: str, device: torch.device):
         if getattr(model, "use_naf_upsample", False):
             model._load_naf()
 
+    # --- PIXAL3D_NAF_ANE_REPLACE: swap selected NAF Conv2d modules with -----
+    # CoreML/ANE-backed wrappers (Session 14 probe).  Substrings are matched
+    # against named_modules() under each NAF; e.g.
+    #   PIXAL3D_NAF_ANE_REPLACE=sem_encoder.1.conv1,sem_encoder.1.conv2
+    # The wrapper traces each conv once and caches the compiled mlpackage at
+    # /private/tmp/naf_ane_swap_models/.  Compute units default to ALL
+    # (ANE-preferring); override via PIXAL3D_NAF_ANE_COMPUTE_UNITS.  Precision
+    # defaults to FLOAT16; override via PIXAL3D_NAF_ANE_PRECISION.
+    ane_replace_csv = os.environ.get("PIXAL3D_NAF_ANE_REPLACE", "").strip()
+    if ane_replace_csv:
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        try:
+            from naf_ane_swap import install_ane_swap_on_naf  # type: ignore
+        except Exception as exc:
+            print(f"[ane-swap] ERROR: cannot import naf_ane_swap module: {exc}", flush=True)
+            install_ane_swap_on_naf = None  # type: ignore
+
+        if install_ane_swap_on_naf is not None:
+            substrs = [s.strip() for s in ane_replace_csv.split(",") if s.strip()]
+            compute_units = os.environ.get("PIXAL3D_NAF_ANE_COMPUTE_UNITS", "ALL").strip() or "ALL"
+            compute_precision = os.environ.get("PIXAL3D_NAF_ANE_PRECISION", "FLOAT16").strip() or "FLOAT16"
+            cache_dir = Path(os.environ.get("PIXAL3D_NAF_ANE_CACHE_DIR",
+                                            "/private/tmp/naf_ane_swap_models"))
+            print(f"[ane-swap] PIXAL3D_NAF_ANE_REPLACE={ane_replace_csv} | "
+                  f"compute={compute_units}/{compute_precision} | cache={cache_dir}",
+                  flush=True)
+            total_swapped = 0
+            for attr in (
+                "image_cond_model_ss",
+                "image_cond_model_shape_512",
+                "image_cond_model_shape_1024",
+                "image_cond_model_tex_1024",
+            ):
+                model = getattr(pipeline, attr, None)
+                naf = getattr(model, "naf_model", None) if model is not None else None
+                if naf is None:
+                    continue
+                try:
+                    n = install_ane_swap_on_naf(
+                        naf,
+                        layer_substrs=substrs,
+                        cache_dir=cache_dir,
+                        tag=attr,
+                        compute_units=compute_units,
+                        compute_precision=compute_precision,
+                        verbose=True,
+                    )
+                    total_swapped += n
+                except Exception as exc:
+                    print(f"[ane-swap] WARN: install on {attr} failed: {exc}", flush=True)
+            print(f"[ane-swap] total layers swapped across all NAF instances: {total_swapped}",
+                  flush=True)
+
+    # --- PIXAL3D_NAF_ANE_WHOLE: wrap entire submodule(s) inside each NAF as a -
+    # single CoreML mlprogram (Session 14 stage6).  Example:
+    #   PIXAL3D_NAF_ANE_WHOLE=image_encoder.encoder,image_encoder.sem_encoder
+    # PIXAL3D_NAF_ANE_KEEP_FP32 (csv of op_type substrings) restricts the
+    # fp16 cast: ops whose type contains any substring stay in fp32.
+    # Default candidates for KEEP_FP32: "group_norm" (variance precision),
+    # "layer_norm", "reduce_mean", "reduce_sum".
+    ane_whole_csv = os.environ.get("PIXAL3D_NAF_ANE_WHOLE", "").strip()
+    if ane_whole_csv:
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        try:
+            from naf_ane_swap import install_ane_swap_whole_module_on_naf  # type: ignore
+        except Exception as exc:
+            print(f"[ane-swap] ERROR: cannot import naf_ane_swap whole-module: {exc}", flush=True)
+            install_ane_swap_whole_module_on_naf = None  # type: ignore
+        if install_ane_swap_whole_module_on_naf is not None:
+            paths = [s.strip() for s in ane_whole_csv.split(",") if s.strip()]
+            compute_units = os.environ.get("PIXAL3D_NAF_ANE_COMPUTE_UNITS", "ALL").strip() or "ALL"
+            compute_precision = os.environ.get("PIXAL3D_NAF_ANE_PRECISION", "FLOAT16").strip() or "FLOAT16"
+            fp32_csv = os.environ.get("PIXAL3D_NAF_ANE_KEEP_FP32", "").strip()
+            fp32_substrs = tuple(s.strip() for s in fp32_csv.split(",") if s.strip())
+            cache_dir = Path(os.environ.get("PIXAL3D_NAF_ANE_CACHE_DIR",
+                                            "/private/tmp/naf_ane_swap_models"))
+            print(f"[ane-swap] PIXAL3D_NAF_ANE_WHOLE={ane_whole_csv} | "
+                  f"compute={compute_units}/{compute_precision} | "
+                  f"keep_fp32={fp32_substrs!r} | cache={cache_dir}", flush=True)
+            total_whole = 0
+            for attr in (
+                "image_cond_model_ss",
+                "image_cond_model_shape_512",
+                "image_cond_model_shape_1024",
+                "image_cond_model_tex_1024",
+            ):
+                model = getattr(pipeline, attr, None)
+                naf = getattr(model, "naf_model", None) if model is not None else None
+                if naf is None:
+                    continue
+                try:
+                    n = install_ane_swap_whole_module_on_naf(
+                        naf,
+                        module_dotted_paths=paths,
+                        cache_dir=cache_dir,
+                        tag=attr,
+                        compute_units=compute_units,
+                        compute_precision=compute_precision,
+                        fp32_op_substrs=fp32_substrs,
+                        verbose=True,
+                    )
+                    total_whole += n
+                except Exception as exc:
+                    print(f"[ane-swap] WARN: whole-module install on {attr} failed: {exc}", flush=True)
+            print(f"[ane-swap] total whole-modules swapped: {total_whole}", flush=True)
+
+    # --- PIXAL3D_NAF_METAL: replace NAF image_encoder torch ops with custom -----
+    # Metal kernels (Session 15 §9-C).  Replaces nn.Conv2d (k=1|3 reflect),
+    # nn.GroupNorm, nn.SiLU under naf.image_encoder with Metal-backed
+    # equivalents from scripts/metal_naf_kernels.py.  Bit-matches MPSGraph
+    # within fp32 noise (max < 5e-6 on EncBlock-equivalent self-test);
+    # gives a controllable substrate for future Winograd / mixed-precision
+    # experiments.  Does NOT close the cuDNN gap on its own (S15 sweep
+    # established that's a TF32-vs-fp32 algorithm difference, not a
+    # reduction-order or direct-vs-Winograd issue).
+    #
+    # Usage:
+    #   PIXAL3D_NAF_METAL=1            # default scope = image_encoder
+    #   PIXAL3D_NAF_METAL_SCOPE=image_encoder    # override scope attr name
+    if (os.environ.get("PIXAL3D_NAF_METAL", "").strip()
+            not in ("", "0", "false", "False", "off", "OFF")):
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        try:
+            from naf_metal_swap import install_metal_on_naf  # type: ignore
+        except Exception as exc:
+            print(f"[metal-swap] ERROR: cannot import naf_metal_swap: {exc}", flush=True)
+            install_metal_on_naf = None  # type: ignore
+
+        if install_metal_on_naf is not None:
+            scope = os.environ.get("PIXAL3D_NAF_METAL_SCOPE", "image_encoder").strip() \
+                or "image_encoder"
+            print(f"[metal-swap] PIXAL3D_NAF_METAL=on | scope={scope}", flush=True)
+            grand_total = {"conv2d": 0, "groupnorm": 0, "silu": 0, "skipped_conv": 0}
+            for attr in (
+                "image_cond_model_ss",
+                "image_cond_model_shape_512",
+                "image_cond_model_shape_1024",
+                "image_cond_model_tex_1024",
+            ):
+                model = getattr(pipeline, attr, None)
+                naf = getattr(model, "naf_model", None) if model is not None else None
+                if naf is None:
+                    continue
+                try:
+                    counts = install_metal_on_naf(naf, tag=attr, scope=scope, verbose=True)
+                    for k, v in counts.items():
+                        grand_total[k] = grand_total.get(k, 0) + v
+                except Exception as exc:
+                    print(f"[metal-swap] WARN: install on {attr} failed: {exc}", flush=True)
+            print(f"[metal-swap] grand totals across all NAFs: {grand_total}", flush=True)
+
     # PIXAL3D_FP32_MODELS=<comma-list> selectively upcasts named submodels to
     # fp32.  Use case: testing whether a specific model's MPS bf16/fp16
     # numerics are the source of visible artifacts (e.g. tex_slat_decoder
@@ -571,6 +1033,18 @@ def init_pipeline(model_path: str, device: torch.device):
             if hasattr(sub, "convert_to_fp32") and callable(sub.convert_to_fp32):
                 sub.convert_to_fp32()
                 print(f"  {name}: convert_to_fp32() called")
+            elif hasattr(sub, "convert_to") and callable(sub.convert_to):
+                # DiT-style API (sparse_structure_flow / structured_latent_flow).
+                # Sets self.dtype AND applies convert_module_to(fp32) on the
+                # transformer blocks.  This is what makes `manual_cast(h, self.dtype)`
+                # inside forward become a no-op (or upcast) instead of a downcast
+                # to bf16, so attention/matmul actually run in fp32 on MPS.
+                # S19 candidate fix for fairy-house upstream DiT drift —
+                # §10's old "fp32 was a no-op" rule-out only covered the case
+                # where this branch was never hit (decoders use convert_to_fp32;
+                # DiTs use convert_to and were untouched by it).
+                sub.convert_to(torch.float32)
+                print(f"  {name}: convert_to(torch.float32) called (DiT path)")
             if hasattr(sub, "dtype"):
                 sub.dtype = torch.float32
                 print(f"  {name}: .dtype attr -> torch.float32")
@@ -658,36 +1132,24 @@ def init_pipeline(model_path: str, device: torch.device):
                 return tuple(_to_device(x, device) for x in obj)
             if isinstance(obj, dict):
                 return {k: _to_device(v, device) for k, v in obj.items()}
-            # SparseTensor: has a .data dict with tensor entries.
-            moved_sparse = False
-            if hasattr(obj, "data") and isinstance(obj.data, dict):
-                new_data = {}
-                for k, v in obj.data.items():
-                    if torch.is_tensor(v):
-                        new_data[k] = v.to(device)
-                    else:
-                        new_data[k] = v
-                obj.data = new_data
-                moved_sparse = True
-            # Also walk direct coords/feats attributes (some SparseTensor
-            # versions don't store via .data dict).
-            for attr in ("coords", "feats"):
-                if hasattr(obj, attr):
-                    cur = getattr(obj, attr)
-                    if torch.is_tensor(cur) and cur.device != torch.device(device):
-                        try:
-                            setattr(obj, attr, cur.to(device))
-                            moved_sparse = True
-                        except Exception:
-                            pass
-            # Drain spatial cache: device-specific neighbor tables become
-            # stale once we move the SparseTensor.  Cleanest fix is to
-            # let them get recomputed lazily on the new device.
-            if hasattr(obj, "_spatial_cache") and isinstance(obj._spatial_cache, dict):
-                if obj._spatial_cache:
-                    obj._spatial_cache = {}
-            if moved_sparse:
-                return obj
+            # SparseTensor: use its native .to(device) which returns a NEW
+            # instance with feats+coords on the right device.  CRITICAL:
+            # SparseTensor.replace() (called by .to()) passes the SAME
+            # _spatial_cache dict through, which holds device-specific
+            # neighbor index tensors (src_idx, tgt_idx, kernel_idx).  After
+            # CPU→MPS move, the new MPS SparseTensor would still reference
+            # CPU cache → device-mismatch in next sparse_conv3d.  Drain
+            # the cache on the moved result so neighbor tables rebuild
+            # lazily on the new device.  This is what blocked the
+            # Session-6 all-DiTs-on-CPU experiment.
+            if hasattr(obj, "feats") and hasattr(obj, "coords") and hasattr(obj, "to"):
+                try:
+                    moved = obj.to(device)
+                    if hasattr(moved, "_spatial_cache") and isinstance(moved._spatial_cache, dict):
+                        moved._spatial_cache = {}
+                    return moved
+                except Exception:
+                    pass
             # Last resort: try .to() if available.
             if hasattr(obj, "to") and callable(obj.to):
                 try:
@@ -1018,6 +1480,35 @@ def _native_o_voxel_env(glb_path: Path) -> dict:
     return env
 
 
+def _run_native_o_voxel_in_process(cmd: list[str]) -> int:
+    """Run the o_voxel native export bridge in-process (no subprocess).
+
+    `cmd` is the full subprocess argv as built by try_export_native_o_voxel_glb:
+      cmd[0] = python interpreter (ignored in in-process mode)
+      cmd[1] = bridge script path (ignored — we import the module directly)
+      cmd[2:] = bridge --flag value pairs
+
+    Returns 0 on success or a non-zero exit code mirroring the bridge's
+    return value.  Exceptions are caught and converted to non-zero.
+    """
+    try:
+        from pixal3d.utils import o_voxel_native_export
+    except ImportError as exc:
+        print(f"[Export] In-process o_voxel bridge import failed ({exc}); "
+              "falling back to subprocess.")
+        return 127
+    try:
+        rc = o_voxel_native_export.main(cmd[2:])
+        return int(rc) if rc is not None else 0
+    except SystemExit as exc:
+        return int(exc.code) if exc.code is not None else 0
+    except Exception as exc:
+        import traceback
+        print(f"[Export] In-process o_voxel bridge raised: {exc}")
+        traceback.print_exc()
+        return 1
+
+
 def _configure_fdg_environment(args):
     os.environ["PIXAL3D_FDG_CAP_PARTIAL_QUADS"] = "1" if args.fdg_cap_partial_quads else "0"
     os.environ["PIXAL3D_FDG_VERBOSE"] = "1" if args.fdg_verbose else "0"
@@ -1042,14 +1533,79 @@ def _prefill_holes_for_native(vertices: np.ndarray, faces: np.ndarray, args) -> 
     )
 
 
+def _prefill_holes(vertices, faces, method, *, verbose=False):
+    """Pre-close pinprick holes before bridge (back-ported from S17)."""
+    import time
+    if method in (None, "none"):
+        return vertices, faces
+    t0 = time.time()
+    if method == "trimesh":
+        import trimesh
+        m = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        before = m.faces.shape[0]
+        trimesh.repair.fill_holes(m)
+        new_v = np.asarray(m.vertices, dtype=vertices.dtype)
+        new_f = np.asarray(m.faces, dtype=faces.dtype)
+        print(f"[PreFill/trimesh] V {vertices.shape[0]:,}->{new_v.shape[0]:,}, "
+              f"F {before:,}->{new_f.shape[0]:,} (+{new_f.shape[0]-before:,} fan-tris), "
+              f"watertight={m.is_watertight} in {time.time()-t0:.1f}s", flush=True)
+        return new_v, new_f
+    if method == "pymeshfix":
+        try:
+            from pymeshfix._meshfix import clean_from_arrays
+        except ImportError as exc:
+            raise SystemExit("[PreFill/pymeshfix] pip install pymeshfix") from exc
+        v_in = vertices.astype(np.float64)
+        f_in = faces.astype(np.int32)
+        v_out, f_out = clean_from_arrays(v_in, f_in, verbose=verbose,
+                                          joincomp=False, remove_smallest_components=False)
+        new_v = np.asarray(v_out, dtype=vertices.dtype)
+        new_f = np.asarray(f_out, dtype=faces.dtype)
+        print(f"[PreFill/pymeshfix] V {vertices.shape[0]:,}->{new_v.shape[0]:,}, "
+              f"F {faces.shape[0]:,}->{new_f.shape[0]:,} in {time.time()-t0:.1f}s", flush=True)
+        return new_v, new_f
+    raise ValueError(f"Unknown --prefill-holes method: {method!r}")
+
+
+def _presmooth_mesh(vertices, faces, method, iterations, *, verbose=False):
+    """Pre-smooth mesh before bridge (back-ported from S17). Taubin recommended."""
+    import time
+    if method in (None, "none") or iterations <= 0:
+        return vertices, faces
+    import trimesh
+    import trimesh.smoothing as ts
+    t0 = time.time()
+    m = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    if method == "taubin":
+        ts.filter_taubin(m, iterations=iterations, lamb=0.5, nu=0.53)
+    elif method == "laplacian":
+        ts.filter_laplacian(m, iterations=iterations, lamb=0.5)
+    elif method == "humphrey":
+        ts.filter_humphrey(m, iterations=iterations)
+    else:
+        raise ValueError(f"Unknown --presmooth: {method!r}")
+    new_v = np.asarray(m.vertices, dtype=vertices.dtype)
+    new_f = np.asarray(m.faces, dtype=faces.dtype)
+    print(f"[PreSmooth/{method}] {iterations} iter on V={new_v.shape[0]:,} F={new_f.shape[0]:,} in {time.time()-t0:.1f}s", flush=True)
+    return new_v, new_f
+
+
 def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, faces: np.ndarray, glb_path: Path, args) -> bool:
     if args.no_texture or args.force_texture_fallback:
         return False
 
-    native_python = _resolve_native_o_voxel_python(args)
-    if native_python is None:
-        print("[Export] Native o_voxel Python not found; using fallback baker.")
-        return False
+    # In-process is the default (single 3.10 venv contains cumesh / flex_gemm /
+    # mtlbvh / mtldiffrast / o_voxel after the unify-py310 consolidation).
+    # Opt back into the old 3.11 trellis-mac subprocess path via
+    # PIXAL3D_NATIVE_SUBPROCESS=1.
+    native_subprocess = os.environ.get("PIXAL3D_NATIVE_SUBPROCESS", "").strip() == "1"
+    native_python = None
+    if native_subprocess:
+        native_python = _resolve_native_o_voxel_python(args)
+        if native_python is None:
+            print("[Export] Native o_voxel Python not found (PIXAL3D_NATIVE_SUBPROCESS=1); "
+                  "using fallback baker.")
+            return False
 
     bridge = ROOT / "pixal3d" / "utils" / "o_voxel_native_export.py"
     if not bridge.exists():
@@ -1076,13 +1632,21 @@ def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, f
     tmp_file.close()
 
     try:
+        native_vertices, native_faces = _prefill_holes(
+            native_vertices, native_faces, args.prefill_holes,
+            verbose=args.native_o_voxel_verbose,
+        )
+        native_vertices, native_faces = _presmooth_mesh(
+            native_vertices, native_faces, args.presmooth, args.presmooth_iterations,
+            verbose=args.native_o_voxel_verbose,
+        )
         _write_mesh_npz(native_input, mesh, native_vertices, native_faces, resolution)
         print(
             f"[Export] Baking PBR textures via native o_voxel "
             f"({args.texture_size}x{args.texture_size}, target={target_faces:,})..."
         )
         cmd = [
-            str(native_python),
+            str(native_python) if native_python is not None else sys.executable,
             str(bridge),
             "--input", str(native_input),
             "--output", str(glb_path),
@@ -1108,10 +1672,63 @@ def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, f
                 cmd.append("--debug-stages-only")
             if args.native_debug_raw_stages:
                 cmd.append("--debug-raw-stages")
+        # ---- S17 back-port: forward selective skip + threshold ----
+        if args.native_skip_cleanup:
+            cmd.append("--skip-cleanup")
+        if args.native_skip_fill_holes:
+            cmd.append("--skip-fill-holes")
+        if args.native_skip_repair_nme:
+            cmd.append("--skip-repair-nme")
+        if args.native_skip_small_cc:
+            cmd.append("--skip-small-cc")
+        if args.native_skip_unify:
+            cmd.append("--skip-unify")
+        if args.native_skip_dedup:
+            cmd.append("--skip-dedup")
+        if args.native_skip_degen:
+            cmd.append("--skip-degen")
+        if args.native_skip_simplify:
+            cmd.append("--skip-simplify")
+        if args.native_skip_simplify_3x:
+            cmd.append("--skip-simplify-3x")
+        if args.native_small_cc_threshold is not None:
+            cmd.extend(["--small-cc-threshold", str(args.native_small_cc_threshold)])
+        if args.native_fill_holes_perimeter is not None:
+            cmd.extend(["--fill-holes-perimeter", str(args.native_fill_holes_perimeter)])
+        if args.native_simplify_impl != "metal":
+            cmd.extend(["--simplify-impl", args.native_simplify_impl])
+        # ---- S17b: compute_charts bisection + knob overrides ----
+        if args.native_save_compute_charts_input is not None:
+            cmd.extend(["--save-compute-charts-input", str(args.native_save_compute_charts_input)])
+        if args.native_compute_charts_area_weight is not None:
+            cmd.extend(["--compute-charts-area-weight", str(args.native_compute_charts_area_weight)])
+        if args.native_compute_charts_perim_weight is not None:
+            cmd.extend(["--compute-charts-perim-weight", str(args.native_compute_charts_perim_weight)])
+        if args.native_precharts_smooth != "none":
+            cmd.extend(["--precharts-smooth", args.native_precharts_smooth])
+            cmd.extend(["--precharts-smooth-iterations", str(args.native_precharts_smooth_iterations)])
 
-        result = subprocess.run(cmd, env=_native_o_voxel_env(glb_path), check=False)
-        if result.returncode != 0:
-            print(f"[Export] Native o_voxel export failed with exit code {result.returncode}; using fallback baker.")
+        if native_subprocess:
+            result = subprocess.run(cmd, env=_native_o_voxel_env(glb_path), check=False)
+            result_code = result.returncode
+        else:
+            # In-process: env vars from _native_o_voxel_env are FLEX_GEMM /
+            # OPENCV_IO_ENABLE_OPENEXR / TMPDIR setdefaults — main() already
+            # sets the first three, and TMPDIR rarely matters here.
+            os.environ.setdefault("TMPDIR", str(glb_path.parent.resolve()))
+            # Release cached MPS allocations before the bridge's CPU-heavy
+            # multi-pass mesh cleanup.  Unlike the old subprocess (which started
+            # fresh with no model weights resident), the in-process bridge runs
+            # in the same interpreter that still holds the DiT/VAE weights; on
+            # multi-million-vertex meshes the resident MPS cache competes for
+            # RAM and pushes the cleanup chain into swap.
+            import gc
+            gc.collect()
+            if torch is not None and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+            result_code = _run_native_o_voxel_in_process(cmd)
+        if result_code != 0:
+            print(f"[Export] Native o_voxel export failed with exit code {result_code}; using fallback baker.")
             return False
         if not glb_path.exists() or glb_path.stat().st_size == 0:
             print("[Export] Native o_voxel finished but did not write a non-empty GLB; using fallback baker.")
@@ -1412,6 +2029,26 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--native-fill-holes-perimeter",
+        type=float,
+        default=None,
+        help=(
+            "Override the max_hole_perimeter used by native o_voxel's "
+            "internal fill_holes calls during the cleanup/simplify chain. "
+            "Try 0.1 on thin fairy-house/palm meshes; larger values can "
+            "close intended openings."
+        ),
+    )
+    parser.add_argument(
+        "--native-preclean-nme",
+        action="store_true",
+        help=(
+            "Run repair_non_manifold_edges on the extracted mesh before the "
+            "native o_voxel cleanup/simplify chain.  Useful for dense thin "
+            "feature meshes where simplify amplifies pre-existing excess edges."
+        ),
+    )
+    parser.add_argument(
         "--native-output-transform",
         choices=["pixal3d", "o_voxel", "y_up"],
         default="pixal3d",
@@ -1499,6 +2136,44 @@ def parse_args():
             "+ GLB export."
         ),
     )
+    # ---- S17 back-port: selective cleanup skip + prefill/presmooth ----
+    parser.add_argument("--native-skip-cleanup", action="store_true",
+                        help="Forward --skip-cleanup: no-op all 6 cumesh cleanup ops in the bridge.")
+    parser.add_argument("--native-skip-fill-holes", action="store_true")
+    parser.add_argument("--native-skip-repair-nme", action="store_true")
+    parser.add_argument("--native-skip-small-cc", action="store_true")
+    parser.add_argument("--native-skip-unify", action="store_true")
+    parser.add_argument("--native-skip-dedup", action="store_true")
+    parser.add_argument("--native-skip-degen", action="store_true")
+    parser.add_argument("--native-skip-simplify", action="store_true",
+                        help="Forward --skip-simplify: bridge no-ops cumesh.simplify.")
+    parser.add_argument("--native-skip-simplify-3x", action="store_true",
+                        help="S21 fix: skip only the destructive 1st simplify(target*3) pass; "
+                             "keep the final simplify(target). Cuts swiss-cheese ~3.6x on Mac.")
+    parser.add_argument("--native-small-cc-threshold", type=float, default=None,
+                        help="Forward --small-cc-threshold: override min_area passed to remove_small_connected_components (try 1e-7 vs default 1e-5).")
+    parser.add_argument("--prefill-holes", choices=["none", "trimesh", "pymeshfix"], default="none",
+                        help="Pre-close pinprick holes in the pipeline mesh before bridge.")
+    parser.add_argument("--presmooth", choices=["none", "laplacian", "taubin", "humphrey"], default="none",
+                        help="Pre-smooth pipeline mesh before bridge (Taubin recommended).")
+    parser.add_argument("--presmooth-iterations", type=int, default=5,
+                        help="Smoothing iterations (default 5).")
+    parser.add_argument("--native-simplify-impl", choices=["metal", "fast"], default="metal",
+                        help="Bridge: choice of simplifier — 'metal' = Pedro's port (default), "
+                             "'fast' = fast_simplification CPU QEM (S17b test).")
+    # ---- S17b: compute_charts bisection + knob overrides ----
+    parser.add_argument("--native-save-compute-charts-input", type=str, default=None,
+                        help="Bridge: dump (vertices, faces, kwargs) handed to cumesh.compute_charts to this .npz. "
+                             "Ship to a CUDA box and run scripts/cuda_compute_charts_test.py for chart-count bisection.")
+    parser.add_argument("--native-compute-charts-area-weight", type=float, default=None,
+                        help="Bridge: override area_penalty_weight kwarg to cumesh.compute_charts (cumesh default 0.1).")
+    parser.add_argument("--native-compute-charts-perim-weight", type=float, default=None,
+                        help="Bridge: override perimeter_area_ratio_weight kwarg to cumesh.compute_charts (cumesh default 0.0001).")
+    parser.add_argument("--native-precharts-smooth", choices=["none", "laplacian", "taubin", "humphrey"], default="none",
+                        help="Bridge: smooth mesh vertices right before compute_charts to heal "
+                             "QEM-induced per-face normal noise (S17b root-cause fix).")
+    parser.add_argument("--native-precharts-smooth-iterations", type=int, default=5,
+                        help="Bridge: smoothing iterations (default 5).")
     return parser.parse_args()
 
 
@@ -1761,6 +2436,64 @@ def main():
 
         torch.manual_seed(args.seed)
         print(f"[Generate] pipeline={args.pipeline_type}, seed={args.seed}")
+
+        # --- PIXAL3D_CUDA_SUBSTITUTE: inject CUDA fixtures at named pipeline ----
+        # stages, bypassing the Mac producer for that stage (Session 15
+        # bisection harness).  Install BEFORE the fixture-dump hooks so that
+        # subsequent dumps capture the substituted output for verification.
+        # See scripts/cuda_substitute.py for stage names and usage.
+        if os.environ.get("PIXAL3D_CUDA_SUBSTITUTE", "").strip():
+            import sys as _sys
+            _scripts_dir = str(Path(__file__).resolve().parent / "scripts")
+            if _scripts_dir not in _sys.path:
+                _sys.path.insert(0, _scripts_dir)
+            try:
+                from cuda_substitute import install_from_env  # type: ignore
+                install_from_env(pipeline, verbose=True)
+            except Exception as exc:
+                print(f"[cuda-sub] ERROR: install_from_env failed: {exc}", flush=True)
+
+        # --- PIXAL3D_HR_SLAT_INJECT: monkey-patch shape_slat_sampler.sample to
+        # return a pre-computed HR shape SLAT (typically from CUDA capture),
+        # bypassing Mac's HR DiT.  Used together with PIXAL3D_CUDA_SUBSTITUTE
+        # for 03a to fully bypass both DiT stages and isolate decoder-only
+        # divergence.  The injected slat must be a SparseTensor pickle.
+        _hr_inject_path = os.environ.get("PIXAL3D_HR_SLAT_INJECT", "").strip()
+        if _hr_inject_path:
+            try:
+                hr_slat_loaded = torch.load(_hr_inject_path, map_location="cpu", weights_only=False)
+                if isinstance(hr_slat_loaded, dict) and "pred_x_0" in hr_slat_loaded:
+                    hr_slat_loaded = hr_slat_loaded["pred_x_0"]
+                # Drain _spatial_cache — CPU-loaded SparseTensors carry stale CPU
+                # index tensors that break MPS sparse attention later in the
+                # pipeline (e.g. texture sampler's RoPE).  Cache rebuilds lazily
+                # on first MPS sparse-conv access on the new device.
+                if hasattr(hr_slat_loaded, "_spatial_cache") and isinstance(hr_slat_loaded._spatial_cache, dict):
+                    hr_slat_loaded._spatial_cache = {}
+                print(f"[hr-inject] Loaded HR slat from {_hr_inject_path}: feats {hr_slat_loaded.feats.shape} coords {hr_slat_loaded.coords.shape}", flush=True)
+                _orig_sampler_sample = pipeline.shape_slat_sampler.sample
+                _hr_inject_state = {"call_count": 0}
+
+                def _patched_sampler_sample(*args, **kwargs):
+                    n = _hr_inject_state["call_count"]
+                    _hr_inject_state["call_count"] += 1
+                    desc = kwargs.get("tqdm_desc", "")
+                    if "HR" in desc or n > 0:
+                        # HR sampling call (or any call after the first) — substitute
+                        print(f"[hr-inject] Intercepting sampler.sample (desc={desc!r}, call {n}) — returning loaded HR slat", flush=True)
+                        slat = hr_slat_loaded.to(device) if hasattr(hr_slat_loaded, 'to') else hr_slat_loaded
+                        # Drain cache again after device move
+                        if hasattr(slat, "_spatial_cache") and isinstance(slat._spatial_cache, dict):
+                            slat._spatial_cache = {}
+                        class _MockResult:
+                            samples = slat
+                        return _MockResult()
+                    return _orig_sampler_sample(*args, **kwargs)
+                pipeline.shape_slat_sampler.sample = _patched_sampler_sample
+                print(f"[hr-inject] Installed sampler.sample monkey-patch.", flush=True)
+            except Exception as exc:
+                print(f"[hr-inject] ERROR: {exc}", flush=True)
+
         if PIXAL3D_DUMP_FIXTURES:
             _install_pipeline_fixture_hooks(pipeline, PIXAL3D_DUMP_FIXTURES)
 
@@ -1831,7 +2564,7 @@ def main():
     # more NMEs on top.  Pre-cleaning produces a less-NME-heavy input for
     # the to_glb pipeline, which should reduce the small_cc culling cascade.
     # See PAMO_PORT_PLAN.md Phase 6 / NEXT_STEPS.md direction 2.
-    if os.environ.get("PIXAL3D_PRECLEAN_NME", "").strip() in ("1", "true", "yes"):
+    if args.native_preclean_nme or os.environ.get("PIXAL3D_PRECLEAN_NME", "").strip() in ("1", "true", "yes"):
         print("[Pre-clean] Running repair_non_manifold_edges on FDG mesh...")
         from pixal3d.utils.cumesh_port.repair import repair_non_manifold_edges as _cpu_repair_nme
         before_v = vertices.shape[0]

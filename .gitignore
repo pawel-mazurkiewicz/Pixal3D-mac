@@ -26,7 +26,11 @@ scratch/
 # Virtual environment
 venv/
 .venv/
+.venv-*/
 env/
+
+# CUDA bisection harness — connection config holds rental host/port
+scripts/cuda/.env
 
 # IDE
 .idea/
