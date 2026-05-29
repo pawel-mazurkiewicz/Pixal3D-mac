@@ -8,6 +8,7 @@ using namespace metal;
 // ──────────────────────────────────────────────────────────────────────
 
 inline uint hash32(uint k, uint N) {
+    if (N == 0) return 0;  // guard div-by-zero (caller loops are bounded by N)
     k ^= k >> 16;
     k *= 0x85ebca6b;
     k ^= k >> 13;
@@ -17,6 +18,7 @@ inline uint hash32(uint k, uint N) {
 }
 
 inline uint hash64(ulong k, uint N) {
+    if (N == 0) return 0;  // guard div-by-zero (caller loops are bounded by N)
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33;
@@ -36,7 +38,13 @@ inline void linear_probing_insert_u32_u32(
     uint key, uint value, uint N
 ) {
     uint slot = hash32(key, N);
-    while (true) {
+    // MSL only has weak CAS, which may fail SPURIOUSLY on an empty slot. If we
+    // advanced the probe on a spurious failure we would leave a gap in the chain
+    // and lookups (which stop at the first empty slot) would miss the key. So:
+    // only advance when the slot is genuinely occupied by a different key; retry
+    // the SAME slot on a spurious failure. Total iters are capped (no GPU spin).
+    uint advanced = 0;
+    for (uint iter = 0; iter < 4u * N + 64u; ++iter) {
         uint expected = 0xFFFFFFFF;
         bool ok = atomic_compare_exchange_weak_explicit(
             &hashmap_keys[slot], &expected, key,
@@ -45,7 +53,9 @@ inline void linear_probing_insert_u32_u32(
             hashmap_values[slot] = value;
             return;
         }
+        if (expected == 0xFFFFFFFF) continue;  // spurious failure — retry same slot
         slot = (slot + 1 < N) ? slot + 1 : 0;
+        if (++advanced >= N) return;           // table genuinely full
     }
 }
 
@@ -55,7 +65,13 @@ inline void linear_probing_insert_u32_u64(
     uint key, ulong value, uint N
 ) {
     uint slot = hash32(key, N);
-    while (true) {
+    // MSL only has weak CAS, which may fail SPURIOUSLY on an empty slot. If we
+    // advanced the probe on a spurious failure we would leave a gap in the chain
+    // and lookups (which stop at the first empty slot) would miss the key. So:
+    // only advance when the slot is genuinely occupied by a different key; retry
+    // the SAME slot on a spurious failure. Total iters are capped (no GPU spin).
+    uint advanced = 0;
+    for (uint iter = 0; iter < 4u * N + 64u; ++iter) {
         uint expected = 0xFFFFFFFF;
         bool ok = atomic_compare_exchange_weak_explicit(
             &hashmap_keys[slot], &expected, key,
@@ -64,7 +80,9 @@ inline void linear_probing_insert_u32_u64(
             hashmap_values[slot] = value;
             return;
         }
+        if (expected == 0xFFFFFFFF) continue;  // spurious failure — retry same slot
         slot = (slot + 1 < N) ? slot + 1 : 0;
+        if (++advanced >= N) return;           // table genuinely full
     }
 }
 
@@ -74,12 +92,13 @@ inline uint linear_probing_lookup_u32_u32(
     uint key, uint N
 ) {
     uint slot = hash32(key, N);
-    while (true) {
+    for (uint probes = 0; probes < N; ++probes) {
         uint prev = hashmap_keys[slot];
         if (prev == 0xFFFFFFFF) return 0xFFFFFFFF;
         if (prev == key) return hashmap_values[slot];
         slot = (slot + 1 < N) ? slot + 1 : 0;
     }
+    return 0xFFFFFFFF;  // table full / not found — never spin the GPU
 }
 
 inline ulong linear_probing_lookup_u32_u64(
@@ -88,12 +107,13 @@ inline ulong linear_probing_lookup_u32_u64(
     uint key, uint N
 ) {
     uint slot = hash32(key, N);
-    while (true) {
+    for (uint probes = 0; probes < N; ++probes) {
         uint prev = hashmap_keys[slot];
         if (prev == 0xFFFFFFFF) return 0xFFFFFFFFFFFFFFFFULL;
         if (prev == key) return hashmap_values[slot];
         slot = (slot + 1 < N) ? slot + 1 : 0;
     }
+    return 0xFFFFFFFFFFFFFFFFULL;  // table full / not found — never spin the GPU
 }
 
 
@@ -112,7 +132,9 @@ inline void linear_probing_insert_u64_u32(
     uint key_hi = uint(key >> 32);
     uint key_lo = uint(key & 0xFFFFFFFFu);
     uint slot = hash64(key, N);
-    while (true) {
+    // See u32 insert: weak CAS may fail spuriously; retry the same slot then.
+    uint advanced = 0;
+    for (uint iter = 0; iter < 4u * N + 64u; ++iter) {
         uint expected_hi = 0xFFFFFFFF;
         bool ok = atomic_compare_exchange_weak_explicit(
             &hashmap_keys_split[slot * 2], &expected_hi, key_hi,
@@ -123,6 +145,7 @@ inline void linear_probing_insert_u64_u32(
             hashmap_values[slot] = value;
             return;
         }
+        if (expected_hi == 0xFFFFFFFF) continue;  // spurious failure — retry same slot
         if (expected_hi == key_hi) {
             uint existing_lo = atomic_load_explicit(&hashmap_keys_split[slot * 2 + 1], memory_order_relaxed);
             if (existing_lo == key_lo) {
@@ -132,6 +155,7 @@ inline void linear_probing_insert_u64_u32(
             }
         }
         slot = (slot + 1 < N) ? slot + 1 : 0;
+        if (++advanced >= N) return;              // table genuinely full
     }
 }
 
@@ -143,7 +167,9 @@ inline void linear_probing_insert_u64_u64(
     uint key_hi = uint(key >> 32);
     uint key_lo = uint(key & 0xFFFFFFFFu);
     uint slot = hash64(key, N);
-    while (true) {
+    // See u32 insert: weak CAS may fail spuriously; retry the same slot then.
+    uint advanced = 0;
+    for (uint iter = 0; iter < 4u * N + 64u; ++iter) {
         uint expected_hi = 0xFFFFFFFF;
         bool ok = atomic_compare_exchange_weak_explicit(
             &hashmap_keys_split[slot * 2], &expected_hi, key_hi,
@@ -153,6 +179,7 @@ inline void linear_probing_insert_u64_u64(
             hashmap_values[slot] = value;
             return;
         }
+        if (expected_hi == 0xFFFFFFFF) continue;  // spurious failure — retry same slot
         if (expected_hi == key_hi) {
             uint existing_lo = atomic_load_explicit(&hashmap_keys_split[slot * 2 + 1], memory_order_relaxed);
             if (existing_lo == key_lo) {
@@ -161,6 +188,7 @@ inline void linear_probing_insert_u64_u64(
             }
         }
         slot = (slot + 1 < N) ? slot + 1 : 0;
+        if (++advanced >= N) return;              // table genuinely full
     }
 }
 
@@ -172,13 +200,14 @@ inline uint linear_probing_lookup_u64_u32(
     uint key_hi = uint(key >> 32);
     uint key_lo = uint(key & 0xFFFFFFFFu);
     uint slot = hash64(key, N);
-    while (true) {
+    for (uint probes = 0; probes < N; ++probes) {
         uint prev_hi = hashmap_keys_split[slot * 2];
         if (prev_hi == 0xFFFFFFFF) return 0xFFFFFFFF;  // empty slot
         uint prev_lo = hashmap_keys_split[slot * 2 + 1];
         if (prev_hi == key_hi && prev_lo == key_lo) return hashmap_values[slot];
         slot = (slot + 1 < N) ? slot + 1 : 0;
     }
+    return 0xFFFFFFFF;  // table full / not found — never spin the GPU
 }
 
 inline ulong linear_probing_lookup_u64_u64(
@@ -189,13 +218,14 @@ inline ulong linear_probing_lookup_u64_u64(
     uint key_hi = uint(key >> 32);
     uint key_lo = uint(key & 0xFFFFFFFFu);
     uint slot = hash64(key, N);
-    while (true) {
+    for (uint probes = 0; probes < N; ++probes) {
         uint prev_hi = hashmap_keys_split[slot * 2];
         if (prev_hi == 0xFFFFFFFF) return 0xFFFFFFFFFFFFFFFFULL;
         uint prev_lo = hashmap_keys_split[slot * 2 + 1];
         if (prev_hi == key_hi && prev_lo == key_lo) return hashmap_values[slot];
         slot = (slot + 1 < N) ? slot + 1 : 0;
     }
+    return 0xFFFFFFFFFFFFFFFFULL;  // table full / not found — never spin the GPU
 }
 
 

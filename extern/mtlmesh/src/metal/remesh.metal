@@ -8,6 +8,7 @@ using namespace metal;
 // ──────────────────────────────────────────────────────────────────────
 
 inline uint hash32(uint k, uint N) {
+    if (N == 0) return 0;  // guard div-by-zero (caller loops are bounded by N)
     k ^= k >> 16;
     k *= 0x85ebca6b;
     k ^= k >> 13;
@@ -17,6 +18,7 @@ inline uint hash32(uint k, uint N) {
 }
 
 inline uint hash64(ulong k, uint N) {
+    if (N == 0) return 0;  // guard div-by-zero (caller loops are bounded by N)
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33;
@@ -31,12 +33,13 @@ inline uint linear_probing_lookup_u32(
     uint key, uint N
 ) {
     uint slot = hash32(key, N);
-    while (true) {
+    for (uint probes = 0; probes < N; ++probes) {
         uint prev = hashmap_keys[slot];
         if (prev == 0xFFFFFFFF) return 0xFFFFFFFF;
         if (prev == key) return hashmap_values[slot];
         slot = (slot + 1 < N) ? slot + 1 : 0;
     }
+    return 0xFFFFFFFF;  // table full / not found — never spin the GPU
 }
 
 inline uint linear_probing_lookup_u64(
@@ -45,12 +48,13 @@ inline uint linear_probing_lookup_u64(
     ulong key, uint N
 ) {
     uint slot = hash64(key, N);
-    while (true) {
+    for (uint probes = 0; probes < N; ++probes) {
         ulong prev = hashmap_keys[slot];
         if (prev == 0xFFFFFFFFFFFFFFFFULL) return 0xFFFFFFFF;
         if (prev == key) return hashmap_values[slot];
         slot = (slot + 1 < N) ? slot + 1 : 0;
     }
+    return 0xFFFFFFFF;  // table full / not found — never spin the GPU
 }
 
 
