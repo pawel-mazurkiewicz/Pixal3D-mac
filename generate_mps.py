@@ -823,6 +823,43 @@ def load_moge_model(device: torch.device, model_name: str = MOGE_MODEL_NAME):
     return model
 
 
+def _install_tex_pbr_recalib(pipeline, recalib_metallic, metallic_mean, metallic_std, sat_boost):
+    """COSMETIC post-decode PBR override on the decoded tex field (NOT a fidelity fix).
+
+    Channel layout (o_voxel_native_export.py:20-25): 0-2 base_color, 3 metallic,
+    4 roughness, 5 alpha; values mapped to [0,1] by decode_tex_slat's ``*0.5+0.5``.
+
+    S29 proved the Mac tex path (flow + decoder + conditioning) is faithful to CUDA,
+    so the decoded field already EQUALS CUDA's for a given object.  This override is
+    therefore stylistic only: ``recalib_metallic`` moment-matches the metallic
+    channel to (metallic_mean, metallic_std) and ``sat_boost`` scales base_color
+    chroma.  Both push output AWAY from CUDA ground truth; default off / no-op.
+    """
+    orig = pipeline.decode_tex_slat
+
+    def wrapped(slat, subs, *a, **k):
+        out = orig(slat, subs, *a, **k)
+        feats = getattr(out, "feats", None)
+        if feats is None or feats.shape[-1] < 4:
+            return out
+        f = feats.clone()
+        if recalib_metallic:
+            m = f[:, 3]
+            cur_std = m.std().clamp_min(1e-6)
+            f[:, 3] = ((m - m.mean()) / cur_std * metallic_std + metallic_mean).clamp(0.0, 1.0)
+            print(f"[tex-recalib] metallic mean {float(m.mean()):.4f} -> "
+                  f"{float(f[:, 3].mean()):.4f} (target {metallic_mean})", flush=True)
+        if sat_boost != 1.0:
+            bc = f[:, 0:3]
+            luma = bc.mean(dim=1, keepdim=True)
+            f[:, 0:3] = (luma + (bc - luma) * sat_boost).clamp(0.0, 1.0)
+            print(f"[tex-recalib] base_color chroma x{sat_boost}", flush=True)
+        return out.replace(f)
+
+    pipeline.decode_tex_slat = wrapped
+    print(f"[tex-recalib] installed (metallic={recalib_metallic}, sat_boost={sat_boost})", flush=True)
+
+
 def init_pipeline(model_path: str, device: torch.device):
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
@@ -1913,6 +1950,33 @@ def parse_args():
     parser.add_argument("--tex-rescale-t", type=float, default=None)
     parser.add_argument("--max-num-tokens", type=int, default=49152)
     parser.add_argument("--texture-size", type=int, default=2048, choices=[512, 1024, 2048, 4096])
+    # --- §4F texture PBR: COSMETIC stylistic override (NOT a fidelity fix) ---
+    # S29 settled §4F: the dramatic colour collapse (robocrab grey) was Bug D (MPS
+    # SDPA cliff in the long-sequence flow DiTs), fixed by SPARSE_ATTN_BACKEND=naive.
+    # The remaining tex path was then proven FULLY FAITHFUL to CUDA: tex decoder
+    # bit-identical CPU==MPS (S6 + S29), tex flow forward CPU==MPS to 1e-6 on the
+    # real fairy inputs (scripts/tex_flow_replay_cpu_vs_mps.py), conditioning
+    # bit-identical (§4F).  => Mac's decoded tex field EQUALS CUDA's for a given
+    # object; the fairy's metallic ~0.41 is the MODEL's genuine output, matched by
+    # both backends — NOT a Mac artifact.  (CUDA's ~0.0002 metallic was a *different*
+    # object, robocrab.)  These flags are therefore a purely COSMETIC stylistic
+    # override; enabling --tex-recalib pushes output AWAY from CUDA ground truth.
+    # Default off.  Keep only if you want artistic control over metallic/saturation.
+    parser.add_argument(
+        "--tex-recalib",
+        dest="tex_recalib",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="COSMETIC: force the decoded metallic channel toward a target mean/std. "
+             "NOT a fidelity fix (the tex path matches CUDA); diverges from CUDA. Default off.",
+    )
+    parser.add_argument("--tex-metallic-mean", type=float, default=0.0,
+                        help="Cosmetic target metallic-channel mean for --tex-recalib.")
+    parser.add_argument("--tex-metallic-std", type=float, default=0.0,
+                        help="Cosmetic target metallic-channel std for --tex-recalib.")
+    parser.add_argument("--tex-sat-boost", type=float, default=1.0,
+                        help="COSMETIC base_color chroma multiplier (1.0 = off). "
+                             "Stylistic; diverges from CUDA ground truth.")
     parser.add_argument(
         "--fdg-cap-partial-quads",
         dest="fdg_cap_partial_quads",
@@ -2413,6 +2477,15 @@ def main():
             raise SystemExit(f"Input image not found: {input_path}")
 
         pipeline = init_pipeline(args.model_path, device)
+
+        if getattr(args, "tex_recalib", False) or getattr(args, "tex_sat_boost", 1.0) != 1.0:
+            _install_tex_pbr_recalib(
+                pipeline,
+                recalib_metallic=bool(getattr(args, "tex_recalib", False)),
+                metallic_mean=float(getattr(args, "tex_metallic_mean", 0.0002)),
+                metallic_std=float(getattr(args, "tex_metallic_std", 0.001)),
+                sat_boost=float(getattr(args, "tex_sat_boost", 1.0)),
+            )
 
         print(f"[Input] {input_path}")
         image = Image.open(input_path)
