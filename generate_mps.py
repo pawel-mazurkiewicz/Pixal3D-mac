@@ -554,7 +554,15 @@ def _dump_run_metadata(fixture_dir: str, *, image_path: str, args_dict: dict,
 def _configure_mps_environment():
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     os.environ.setdefault("ATTN_BACKEND", "sdpa")
-    os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
+    # S26: MPS's fused scaled_dot_product_attention is numerically wrong for the
+    # flow DiTs' real (post-RMSNorm/RoPE) q/k/v — per-call std off by several %,
+    # compounding across 30 residual blocks into a variance collapse of the
+    # sampled shape/tex latents (geometry shrinkage + perforation + colour death).
+    # CPU/CUDA SDPA are bit-exact; only the MPS fused kernel diverges.  The 'naive'
+    # backend computes attention as chunked fp32 matmul+softmax, which matches
+    # CPU/CUDA to ~1e-6 (verified op-by-op).  Dense image-cond attention keeps sdpa
+    # (proven faithful, S25).
+    os.environ.setdefault("SPARSE_ATTN_BACKEND", "naive")
     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
     os.environ.setdefault("FLEX_GEMM_AUTOTUNE_CACHE_PATH", str(ROOT / "autotune_cache.json"))
     os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "0")
