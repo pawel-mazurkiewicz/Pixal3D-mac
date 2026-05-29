@@ -22,6 +22,7 @@ scratch/
 # OMC / session state
 .omc/
 .claude/
+.rag/
 
 # Virtual environment
 venv/
@@ -44,3 +45,6 @@ scripts/cuda/.env
 Thumbs.db
 
 tmp
+
+# Outputs
+*.glb

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "managedLinks": {
+    "session-end": {
+      "enabledAt": "2026-05-28T17:25:14.613524+00:00",
+      "linkName": "session-end",
+      "source": "/Users/pawelma/.agent-skill-manager/vault/session-end"
+    }
+  }
+}

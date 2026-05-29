@@ -1,20 +1,20 @@
 # Pixal3D Apple Silicon production environment — Python 3.10
 #
-# This is the pinned dependency set for the unified .venv-py310 (the
-# unify-py310 consolidation: one Python 3.10 venv replacing the old 3.12
-# Pixal3D venv + 3.11 trellis-mac bridge venv). Versions captured from a
-# verified working environment that produces bit-parity meshes vs the prior
-# 3.12 setup (fairy raw mesh V=3,940,419 / F=8,586,890).
+# This is the pinned dependency set for the unified .venv (one Python 3.10 venv
+# replacing the old 3.12 Pixal3D venv + 3.11 trellis-mac bridge venv). Versions
+# captured from a verified working environment that produces bit-parity meshes
+# vs the prior 3.12 setup (fairy raw mesh V=3,940,419 / F=8,586,890).
 #
-# SETUP
-#   /opt/homebrew/opt/python@3.10/bin/python3.10 -m venv .venv-py310
-#   .venv-py310/bin/pip install -U pip wheel setuptools
-#   uv pip install --python .venv-py310/bin/python -r requirements-mac.txt
+# SETUP (the easy path is `./scripts/setup_mac.sh`; manual steps below)
+#   /opt/homebrew/opt/python@3.10/bin/python3.10 -m venv .venv
+#   .venv/bin/pip install -U pip wheel setuptools
+#   .venv/bin/pip install -r requirements-mac.txt   # or: uv pip install --python .venv/bin/python -r requirements-mac.txt
 #
-#   # Vendored native Metal packages (compile xcrun .metal -> .metallib;
-#   # natten-mps is pure-Python but install it the same way):
+#   # Vendored native Metal packages (compile xcrun .metal -> .metallib, so the
+#   # Xcode Metal toolchain must be installed first; natten-mps is pure-Python
+#   # but install it the same way):
 #   for p in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel natten-mps; do
-#     uv pip install --python .venv-py310/bin/python -e extern/$p --no-build-isolation
+#     .venv/bin/pip install -e extern/$p --no-build-isolation
 #   done
 #
 # NOTES

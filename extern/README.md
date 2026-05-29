@@ -31,11 +31,19 @@ contained while preserving the ability to pull upstream fixes.
 
 ## Building
 
-All packages install editable into `.venv-py310/`:
+> **Requires the Xcode Metal toolchain.** `mtlmesh`, `mtlgemm`, `mtlbvh`, and
+> `mtldiffrast` compile their `.metal` shaders to `.metallib` **at install time**
+> via `xcrun metal` (see each package's `setup.py` `MetalBuildExt`). Install the
+> Xcode Command Line Tools first (`xcode-select --install`) and confirm
+> `xcrun --find metal` succeeds. The `.metallib` files are untracked build
+> artifacts — never commit them; they regenerate on install.
+
+The easiest path is the repo's `./scripts/setup_mac.sh`. To do it by hand, all
+packages install editable into `.venv/`:
 
 ```bash
 for pkg in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel natten-mps; do
-  .venv-py310/bin/pip install -e extern/$pkg --no-build-isolation
+  .venv/bin/pip install -e extern/$pkg --no-build-isolation
 done
 ```
 
@@ -62,10 +70,16 @@ touches the same kernel — review the merge carefully.
 
 ## Pushing local fixes upstream
 
+Several fixes in these packages are genuine upstream bugs (the `mtlbvh`
+traversal-stack overflow, the `mtlmesh` hash/CAS + `simplify.metal` volatile
+fixes, the `mtldiffrast` depth-test fix) and should be sent back as PRs. The full
+per-package change inventory and the PR workflow (subtree push **or** replaying
+individual commits onto a clean upstream clone with `format-patch --relative`)
+live in **[`UPSTREAMING.md`](UPSTREAMING.md)**.
+
+Quick reference (whole-prefix push):
+
 ```bash
 git subtree push --prefix=extern/mtlmesh \
   git@github.com:pedronaugusto/mtlmesh.git <local-fix-branch>
 ```
-
-This is the long-term path for upstreaming the `simplify.metal` volatile
-fix to Pedro.
