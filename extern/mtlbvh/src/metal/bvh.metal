@@ -171,15 +171,20 @@ inline float2 bb_ray_intersect(BvhBoundingBox bb, float3 pos, float3 dir) {
 }
 
 // ─── Fixed-size stack ────────────────────────────────────────────────────────
-// Depth 24 is sufficient: a balanced 4-ary BVH with 40K leaves has depth ~8,
-// so 24 provides ample margin while cutting register pressure vs 32/48.
+// Depth 24 was NOT sufficient: this BVH is 4-ary and pushes up to 4 children per
+// pop, so max stack occupancy ≈ 3·tree_depth+1. A multi-million-triangle mesh
+// (e.g. the 8.6M-face decoded mesh) has BVH4 depth ~11-15, needing ~34-46 slots.
+// At 24 the stack silently dropped pushes (`if count < 24`) → whole subtrees were
+// skipped → closest_triangle missed the true nearest primitive and OVER-estimated
+// distance (returned >0 even AT a vertex). That corrupted the narrow-band UDF and
+// made remesh holey/fragmented. 64 covers BVH4 depth ~21 (4^21 leaves).
 
-struct FixedStack24 {
-    int elems[24];      // 96 bytes — down from 128/192
+struct FixedStack64 {
+    int elems[64];
     int count = 0;
 
     void push(int val) {
-        if (count < 24) elems[count++] = val;
+        if (count < 64) elems[count++] = val;
     }
     int pop() { return elems[--count]; }
     bool empty() { return count <= 0; }
@@ -258,7 +263,7 @@ inline int closest_triangle(
     thread float& out_dist,
     float max_dist_sq = BVH_MAX_DIST_SQ
 ) {
-    FixedStack24 stack;
+    FixedStack64 stack;
     stack.push(0);
 
     float shortest_dist_sq = max_dist_sq;
@@ -340,7 +345,7 @@ inline int ray_intersect(
     device const BvhTriangle* tris,
     thread float& out_t
 ) {
-    FixedStack24 stack;
+    FixedStack64 stack;
     stack.push(0);
 
     float mint = BVH_MAX_DIST;
@@ -381,7 +386,7 @@ inline float3 avg_normal_around_point(
     device const BvhNode* nodes,
     device const BvhTriangle* tris
 ) {
-    FixedStack24 stack;
+    FixedStack64 stack;
     stack.push(0);
 
     float total_weight = 0.0f;
