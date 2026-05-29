@@ -2047,11 +2047,14 @@ def parse_args():
     )
     parser.add_argument(
         "--native-remesh",
-        action="store_true",
-        help="Enable o_voxel's narrow-band dual-contouring remesh branch before simplification.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use o_voxel's narrow-band dual-contouring remesh branch (rebuilds a "
+             "watertight manifold, matching the CUDA reference). On by default; "
+             "pass --no-native-remesh to fall back to the simplify-sieve branch.",
     )
     parser.add_argument("--native-remesh-band", type=float, default=1.0)
-    parser.add_argument("--native-remesh-project", type=float, default=0.0)
+    parser.add_argument("--native-remesh-project", type=float, default=0.9)
     parser.add_argument(
         "--native-prefill-holes-perimeter",
         type=float,
