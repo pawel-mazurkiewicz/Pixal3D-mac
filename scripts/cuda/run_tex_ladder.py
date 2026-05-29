@@ -118,6 +118,18 @@ def _patched_dump(name, payload, fixture_dir=None):
                 _emit(name, {"note": f"no subs list (type={type(payload).__name__})"})
             return
 
+        # --- decoded texture field (06) — MUST precede the generic handler
+        # (06 is also a SparseTensor; the generic branch below would otherwise
+        # swallow it with _tstats and skip _basecolor_sat).
+        if name == "06_tex_slat_decoded":
+            feats, coords = _feats_coords(payload)
+            if feats is None:
+                _emit(name, {"note": "no .feats", "type": type(payload).__name__})
+            else:
+                _emit(name, _basecolor_sat(feats))
+            print("[ladder] reached 06 — exiting before GLB extract", flush=True)
+            os._exit(0)
+
         # --- SparseTensor latents (02 / 03a / 03b / 05) -------------------
         feats, coords = _feats_coords(payload)
         if feats is not None:
@@ -130,16 +142,6 @@ def _patched_dump(name, payload, fixture_dir=None):
                           coords=(coords.detach().cpu().numpy() if coords is not None else None))
             return
 
-        # --- decoded texture field (06) -----------------------------------
-        if name == "06_tex_slat_decoded":
-            feats, coords = _feats_coords(payload)
-            if feats is None:
-                _emit(name, {"note": "no .feats", "type": type(payload).__name__})
-            else:
-                _emit(name, _basecolor_sat(feats))
-            print("[ladder] reached 06 — exiting before GLB extract", flush=True)
-            os._exit(0)
-
         _emit(name, {"note": f"unhandled payload type={type(payload).__name__}"})
     except Exception as exc:
         _emit(name, {"error": repr(exc)})
@@ -148,9 +150,9 @@ def _patched_dump(name, payload, fixture_dir=None):
 inf._dump_fixture = _patched_dump  # direct calls + hooks resolve the global at call time
 
 inf.run_inference(
-    image_path="assets/images/9_img.png",
+    image_path=os.environ.get("TEX_LADDER_IMAGE", "assets/images/9_img.png"),
     output_path="/workspace/cuda_bisect/out/ladder.glb",
-    seed=42,
+    seed=int(os.environ.get("TEX_LADDER_SEED", "42")),
     manual_fov=0.0,  # <=0 => auto-estimate via MoGe-2 (matches default)
     model_path=inf.MODEL_PATH,
     low_vram=False,
