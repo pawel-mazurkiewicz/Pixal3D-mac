@@ -1361,10 +1361,15 @@ def main(argv=None) -> int:
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # include_normals=True: emit the NORMAL accessor. to_glb already computes
+    # smooth vertex normals (postprocess.py compute_vertex_normals), but trimesh's
+    # glb exporter drops them by default (include_normals=None) -> viewers fall
+    # back to FLAT per-face normals -> faceted/"chunky" look. The CUDA reference
+    # GLB ships normals; matching it makes Mac render smooth.
     try:
-        textured_mesh.export(str(output), extension_webp=True)
+        textured_mesh.export(str(output), extension_webp=True, include_normals=True)
     except TypeError:
-        textured_mesh.export(str(output))
+        textured_mesh.export(str(output), include_normals=True)
 
     if args.verbose:
         print(f"[o_voxel-native] wrote {output} ({output.stat().st_size:,} bytes)")
