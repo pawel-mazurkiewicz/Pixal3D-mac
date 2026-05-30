@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+
+# Large CUDA-captured test fixtures (kept out of repo; document path in README)
+test_fixtures/*.pt
+test_fixtures/natten-fixture*
+
+# Editor artefacts
+.vscode/
+.idea/
+*.swp
+.DS_Store
