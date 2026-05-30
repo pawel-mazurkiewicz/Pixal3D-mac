@@ -2,6 +2,8 @@
 
 # Pixal3D — Apple Silicon (MPS / Metal) Port
 
+![alt text](assets/readme/image.png)
+
 **Unofficial fork that runs [Pixal3D](https://ldyang694.github.io/projects/pixal3d/) image-to-3D generation on Apple Silicon Macs — no CUDA required.**
 
 </div>
@@ -17,7 +19,7 @@
 
 ## What this is
 
-This is a community port of **Pixal3D** (Pixel-Aligned 3D Generation from Images,
+This is a port of **Pixal3D** (Pixel-Aligned 3D Generation from Images,
 SIGGRAPH 2026, by Tsinghua University / Tencent ARC Lab / Victoria University of
 Wellington) to **Apple Silicon**. The upstream pipeline targets NVIDIA GPUs and
 depends on CUDA-only building blocks — `flash_attn`, `nvdiffrast`, fused
@@ -36,7 +38,9 @@ Tencent, or Tsinghua University.
 
 ### How it came about
 
-The port grew out of a long divergence-hunting investigation: get the CUDA
+The primary motivation is simple: CUDA and NVIDIA GPUs should not be a prerequisite for running open weight models created by state-of-the-art research. Apple Silicon Macs are powerful machines that are strongly underrepresented in the space — not because the hardware can't manage to do what Nvidia GPUs do, but because the ecosystem defaults to CUDA and rarely (if ever) ships Metal paths. This port is an attempt to change that for Pixal3D.
+
+Making that work in practice meant a long divergence-hunting investigation: get the
 pipeline running on Metal, then chase down every place where Apple's fp32 / MPS
 numerics or a missing kernel caused the mesh or texture to diverge from the CUDA
 reference. Several genuine bugs were found and fixed along the way (an MPS fused
@@ -57,13 +61,14 @@ are:
 
 The pipeline runs end-to-end and produces watertight, textured GLB meshes whose
 geometry and PBR colour closely match the CUDA reference. Known residuals are
-small and documented in `INVESTIGATION_FACTS.md` / `PIPELINE_MAP.md §6`
-(intrinsic fp32-vs-TF32 reduction-order drift, minor thin-feature simplify holes).
-Expect a single 1024-cascade generation to take several minutes on an M-series Mac.
+small - intrinsic fp32-vs-TF32 reduction-order drift, minor thin-feature simplify holes, honest small difference between implementations.
 
 ## Requirements
 
-- **Apple Silicon Mac** (M1 or newer). Intel Macs are not supported.
+- **Apple Silicon Mac** (M3 or newer). Intel Macs are not supported.
+Two kernels in mtlmesh use native float atomics that only exist on Apple9+ (M3 and newer):
+  - simplify.metal — atomic_min/atomic_max on floats
+  - atlas.metal — atomic_float
 - **macOS** recent enough to provide the Metal toolchain (tested on macOS 14+).
 - **Xcode Command Line Tools** — required. The vendored Metal packages compile
   `.metal` shaders to `.metallib` **at install time** using `xcrun metal`, so the
@@ -81,6 +86,10 @@ Expect a single 1024-cascade generation to take several minutes on an M-series M
   is pinned against it (e.g. `numpy<2.3`, which dropped 3.10 in 2.4+).
 - Disk space for the model weights, which are pulled from Hugging Face
   (`TencentARC/Pixal3D`) on first run.
+
+## Author setup
+
+The port was developed and tested on MacBook Pro 16" M5 Max with 128GB of unified memory and 40 core GPU.
 
 ## Setup
 
@@ -142,6 +151,14 @@ catalogued exhaustively in [`PIPELINE_MAP.md §7`](PIPELINE_MAP.md).
 The production numerics recipe (matches the CUDA reference most closely) is already
 the default; you do **not** need to set any env vars for a normal run.
 
+## Performance
+
+Expect a single 1024-cascade generation to take several minutes on an M-series Mac. A 1536_cascade pipelines took up to 50 minutes (at 2048x2048 texture resolution) on my M5 Max - YMMV.
+
+This is non-exhaustive list of metrics for evaluations done:
+
+![performance](assets/readme/performance.png)
+
 ## How it works (architecture)
 
 The Mac pipeline is the upstream Pixal3D pipeline with CUDA building blocks swapped
@@ -163,10 +180,29 @@ hashmap, fp32 upcasts, the `naive` chunked-fp32 sparse-attention backend that wo
 around the MPS SDPA cliff). All of this is documented stage-by-stage in
 `PIPELINE_MAP.md §3–§5`.
 
+## Evaluations
+
+I did some evaluations of the port against the images that ships with official Pixal3D, here are some of them:
+
+![eval-1](assets/readme/eval-1.png)
+![eval-2](assets/readme/eval-2.png)
+![eval-3](assets/readme/eval-3.png)
+![eval-4](assets/readme/eval-4.png)
+![eval-5](assets/readme/eval-5.png)
+![eval-6](assets/readme/eval-6.png)
+![eval-7](assets/readme/eval-7.png)
+![eval-8](assets/readme/eval-8.png)
+![eval-9](assets/readme/eval-9.png)
+![eval-10](assets/readme/eval-10.png)
+![eval-11](assets/readme/eval-11.png)
+![eval-12](assets/readme/eval-12.png)
+![eval-13](assets/readme/eval-13.png)
+
+
 ## Contributing fixes upstream
 
 Several of the fixes in this fork are genuine bugs in the underlying native
-libraries and should be sent back to their upstreams (Pedro Augusto's `mtl*`
+libraries and should be sent back to their upstreams (Pedro Naugusto's `mtl*`
 packages and our own `natten-mps`). The per-package change inventory and the PR
 workflow are written up in **[`extern/UPSTREAMING.md`](extern/UPSTREAMING.md)**.
 
@@ -180,7 +216,7 @@ This port stands on:
   University of Wellington), built on
   [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) and
   [Direct3D-S2](https://github.com/DreamTechAI/Direct3D-S2).
-- **[Pedro Augusto](https://github.com/pedronaugusto)'s Metal libraries**
+- **[Pedro Naugusto](https://github.com/pedronaugusto)'s Metal libraries**
   ([mtlmesh](https://github.com/pedronaugusto/mtlmesh),
   [mtlgemm](https://github.com/pedronaugusto/mtlgemm),
   [mtlbvh](https://github.com/pedronaugusto/mtlbvh),
@@ -206,6 +242,5 @@ If you use the model, please cite the original Pixal3D paper:
 
 ## License
 
-This fork inherits the upstream Pixal3D license (see [`LICENSE`](LICENSE)). The
-vendored `extern/` packages carry their own licenses in their respective
-subdirectories.
+This fork inherits the upstream Pixal3D MIT license (see [`LICENSE`](LICENSE)). The vendored `extern/` packages carry their own licenses in their respective subdirectories.
+

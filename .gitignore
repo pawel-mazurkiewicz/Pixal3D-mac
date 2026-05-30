@@ -48,3 +48,8 @@ tmp
 
 # Outputs
 *.glb
+
+# AI Junk
+.codex/
+.agents/
+.claude/

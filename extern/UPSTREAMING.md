@@ -4,8 +4,14 @@ Several fixes carried in `extern/` are genuine bugs in the underlying native
 libraries, not Pixal3D-specific glue. They should be contributed back to their
 upstreams. This document is the inventory + the PR workflow.
 
-Each fix below is a self-contained commit on top of the vendored subtree import,
-so it can be cherry-picked / replayed onto a clean upstream checkout cleanly.
+Each fix below is a self-contained commit touching only files under one
+`extern/<pkg>/`, so it can be cherry-picked / replayed onto a clean upstream
+checkout cleanly.
+
+> **Commit hashes are branch-local.** The SHAs in the tables and commands below
+> are the current `feat/apple-silicon-port` hashes; a future rebase will rewrite
+> them. If one no longer resolves, find the commit by its subject line (the
+> summaries below are unique) and substitute the new hash.
 
 ---
 
@@ -15,7 +21,7 @@ so it can be cherry-picked / replayed onto a clean upstream checkout cleanly.
 
 | Fix | Commit | Files | Summary |
 |---|---|---|---|
-| BVH traversal stack 24 → 64 | `d54063a3` | `src/metal/bvh.metal` | `closest_triangle` (used by `unsigned_distance_kernel` and all ray/closest kernels) used a 24-deep `FixedStack` whose `push()` silently dropped entries past 24. The BVH is 4-ary (~`3*depth+1` max occupancy); a multi-million-triangle mesh has depth ~11–15 → needs ~34–46 slots, so whole subtrees were skipped and `unsigned_distance` over-estimated (returned >0 even at a mesh vertex). That corrupts the narrow-band UDF driving the dual-contour remesh → holey/fragmented mesh. Small meshes never overflowed, which hid it. |
+| BVH traversal stack 24 → 64 | `0b057cf2` | `src/metal/bvh.metal` | `closest_triangle` (used by `unsigned_distance_kernel` and all ray/closest kernels) used a 24-deep `FixedStack` whose `push()` silently dropped entries past 24. The BVH is 4-ary (~`3*depth+1` max occupancy); a multi-million-triangle mesh has depth ~11–15 → needs ~34–46 slots, so whole subtrees were skipped and `unsigned_distance` over-estimated (returned >0 even at a mesh vertex). That corrupts the narrow-band UDF driving the dual-contour remesh → holey/fragmented mesh. Small meshes never overflowed, which hid it. |
 
 **This is the highest-value upstream fix** — it was the root cause of the
 long-standing "Metal remesh is broken" symptom (Bug E). Verification in the commit
@@ -26,11 +32,11 @@ message: at-vertex distance `0.002 → 0.000001`; remesh on the real fairy mesh
 
 | Fix | Commit | Files | Summary |
 |---|---|---|---|
-| Bound hash linear-probing loops + correct weak-CAS inserts | `8b556f0a` | `src/metal/hash.metal`, `src/metal/remesh.metal` | (1) Every linear-probe loop was an unbounded `while(true)`; a non-terminating probe wedges the GPU and can crash WindowServer / thermally lock the machine. Bounded every probe to ≤ N iterations (a correct table always resolves within N → behaviour unchanged) and guarded `hash32/hash64` against N==0. (2) MSL only has `atomic_compare_exchange_weak_explicit`, which can fail *spuriously* on an empty slot; the insert then advanced the probe, leaving a gap → lookups miss keys (~24% drop, non-deterministic). Fixed by retrying the SAME slot on spurious failure and advancing only on genuine occupancy (CUDA uses strong CAS). |
-| `simplify.metal` volatile qualifier (Bug A) | `417cb8b2` | `src/metal/simplify.metal` | The same physical buffer is bound as `device atomic_ulong*` to `propagate_cost_kernel` and `device const ulong*` to `collapse_edges_kernel`. Per MSL spec the compiler may cache stale reads on the bare-load side → the mutual-agreement check sees stale values → simultaneous collapses on shared-vertex edges → 92.6% non-manifold edges. Adding `volatile` to the reader declaration fixes it (`NME 92.6% → 5.15%`, CUDA 5.18%). |
+| Bound hash linear-probing loops + correct weak-CAS inserts | `13aae6c1` | `src/metal/hash.metal`, `src/metal/remesh.metal` | (1) Every linear-probe loop was an unbounded `while(true)`; a non-terminating probe wedges the GPU and can crash WindowServer / thermally lock the machine. Bounded every probe to ≤ N iterations (a correct table always resolves within N → behaviour unchanged) and guarded `hash32/hash64` against N==0. (2) MSL only has `atomic_compare_exchange_weak_explicit`, which can fail *spuriously* on an empty slot; the insert then advanced the probe, leaving a gap → lookups miss keys (~24% drop, non-deterministic). Fixed by retrying the SAME slot on spurious failure and advancing only on genuine occupancy (CUDA uses strong CAS). |
+| `simplify.metal` volatile qualifier (Bug A) | `b21ac995` | `src/metal/simplify.metal` | The same physical buffer is bound as `device atomic_ulong*` to `propagate_cost_kernel` and `device const ulong*` to `collapse_edges_kernel`. Per MSL spec the compiler may cache stale reads on the bare-load side → the mutual-agreement check sees stale values → simultaneous collapses on shared-vertex edges → 92.6% non-manifold edges. Adding `volatile` to the reader declaration fixes it (`NME 92.6% → 5.15%`, CUDA 5.18%). |
 
-> **Note on the `simplify.metal` fix:** this was originally developed against the
-> pre-subtree `mtlmesh` and re-applied on top of the upstream subtree import
+> **Note on the `simplify.metal` fix:** this was originally developed against an
+> earlier `mtlmesh` and re-applied on top of the vendored upstream import
 > (`212079e`). If upstream has since touched `collapse_edges_kernel`, review the
 > merge carefully — the only required change is the `volatile` qualifier on the
 > `propagated_costs` reader parameter.
@@ -39,44 +45,23 @@ message: at-vertex distance `0.002 → 0.000001`; remesh on the real fairy mesh
 
 | Fix | Commit | Files | Summary |
 |---|---|---|---|
-| Match nvdiffrast depth test (nearest z/w wins, keep-first ties) | `fa220c23` | `src/metal/rasterize.metal`, `src/metal_rasterize.mm`, `tests/*` | The Metal rasterizer kept the *farthest* triangle on overlap (`GreaterEqual` + `clearDepth=0`), opposite to nvdiffrast's cudaraster (keeps smallest z/w via `atomicMin`). At the z=0 UV bake this made overlapping/seam texels resolve last-drawn-wins instead of keep-first, and clipped valid negative-NDC-z geometry. Fix: GL→Metal clip-z remap `(z+w)*0.5` in the vertex shader, recover NDC `2*depth-1` in the fragment shader, depth state `GreaterEqual → Less`, `clearDepth 0 → 1`, and the matching compute-fallback sentinel flip. The 3 affected tests had encoded the buggy behaviour and were corrected to the nvdiffrast convention. 66/66 tests pass. |
+| Match nvdiffrast depth test (nearest z/w wins, keep-first ties) | `7d89a30c` | `src/metal/rasterize.metal`, `src/metal_rasterize.mm`, `tests/*` | The Metal rasterizer kept the *farthest* triangle on overlap (`GreaterEqual` + `clearDepth=0`), opposite to nvdiffrast's cudaraster (keeps smallest z/w via `atomicMin`). At the z=0 UV bake this made overlapping/seam texels resolve last-drawn-wins instead of keep-first, and clipped valid negative-NDC-z geometry. Fix: GL→Metal clip-z remap `(z+w)*0.5` in the vertex shader, recover NDC `2*depth-1` in the fragment shader, depth state `GreaterEqual → Less`, `clearDepth 0 → 1`, and the matching compute-fallback sentinel flip. The 3 affected tests had encoded the buggy behaviour and were corrected to the nvdiffrast convention. 66/66 tests pass. |
 
 ### `natten-mps` → [pawel-mazurkiewicz/natten-mps](https://github.com/pawel-mazurkiewicz/natten-mps) (our own)
 
-This one is **ours**, so "upstreaming" means pushing these commits to our own
-public repo (it is the canonical home), not a third-party PR.
-
 | Change | Commit | Files | Summary |
 |---|---|---|---|
-| In-house Metal kernels for NAF attention (`compat.v020`) | `d439b52e` | `natten_mps/compat/v020.py`, `compat/__init__.py` | The community `natten-mps==0.3.0` fused `na2d` rejects NAF's asymmetric cross-attention (Q/K head_dim 64, V head_dim 256) → silent pure-PyTorch fallback. Added a `compat.v020` shim mirroring the community API but backed by our split kernels (`na2d_qk` → softmax → `na2d_av`) which handle asymmetric K/V natively. Validated ~1e-3 vs CUDA cutlass-fna golden (S11). **Behaviour change:** mesh shifts ~0.4% vs the PyTorch fallback (fp32 reduction-order difference). |
-| Shim walk probes `__dict__`, not `getattr` | `5f3f414c` | `natten_mps/_shim.py` | The `sys.modules` walk used `getattr(mod, "na2d")`, tripping transformers' lazy `_LazyModule.__getattr__` → ~180 alias-warning lines per run. Probe `mod.__dict__.get("na2d")` instead (genuine `from natten import na2d` bindings live in `__dict__`; lazy stubs resolve via `__getattr__`, so they're skipped silently). |
+| In-house Metal kernels for NAF attention (`compat.v020`) | `81bd9751` | `natten_mps/compat/v020.py`, `compat/__init__.py` | The community `natten-mps==0.3.0` fused `na2d` rejects NAF's asymmetric cross-attention (Q/K head_dim 64, V head_dim 256) → silent pure-PyTorch fallback. Added a `compat.v020` shim mirroring the community API but backed by our split kernels (`na2d_qk` → softmax → `na2d_av`) which handle asymmetric K/V natively. Validated ~1e-3 vs CUDA cutlass-fna golden (S11). **Behaviour change:** mesh shifts ~0.4% vs the PyTorch fallback (fp32 reduction-order difference). |
+| Shim walk probes `__dict__`, not `getattr` | `466a3e55` | `natten_mps/_shim.py` | The `sys.modules` walk used `getattr(mod, "na2d")`, tripping transformers' lazy `_LazyModule.__getattr__` → ~180 alias-warning lines per run. Probe `mod.__dict__.get("na2d")` instead (genuine `from natten import na2d` bindings live in `__dict__`; lazy stubs resolve via `__getattr__`, so they're skipped silently). |
 
 ---
 
 ## Workflow
 
-The `extern/` packages (except `o_voxel`, see below) were vendored via
-`git subtree`, so subtree push/pull works directly against the upstream URLs
-without configuring named remotes.
-
-### Option 1 — `git subtree push` (whole-prefix)
-
-Pushes the current `extern/<pkg>` tree to a branch on upstream. Best when you can
-open the PR from a branch that contains the full vendored tree.
-
-```bash
-git subtree push --prefix=extern/mtlbvh \
-  git@github.com:pedronaugusto/mtlbvh.git apple-silicon-fixes
-# then open a PR from pedronaugusto/mtlbvh:apple-silicon-fixes
-```
-
-Substitute the package path + upstream URL from the inventory tables above.
-
-### Option 2 — replay individual commits onto a clean upstream clone (preferred for clean PRs)
-
-`subtree push` carries the whole vendored tree; for a *minimal, reviewable* PR it's
-usually cleaner to replay just the fix commit(s) onto a fresh upstream checkout.
-Each fix above is a single commit touching only files under one `extern/<pkg>`.
+The `extern/` packages are plain in-tree copies (no `git subtree` linkage), so
+upstreaming is done by replaying the fix commit(s) onto a fresh upstream clone
+with `format-patch --relative`. Each fix above is a single commit touching only
+files under one `extern/<pkg>/`, which keeps the PR minimal and reviewable.
 
 ```bash
 # 1. Clone upstream fresh
@@ -85,7 +70,7 @@ cd /tmp/mtlbvh-pr
 git checkout -b fix/bvh-traversal-stack
 
 # 2. Produce the patch from this repo, stripping the extern/<pkg>/ prefix
-git -C /Users/pawelma/code/ai/Pixal3D format-patch -1 d54063a3 \
+git -C /Users/pawelma/code/ai/Pixal3D format-patch -1 0b057cf2 \
   --relative=extern/mtlbvh --stdout > /tmp/bvh.patch
 
 # 3. Apply it onto the clean upstream tree
@@ -99,22 +84,22 @@ git push origin fix/bvh-traversal-stack
 The key flag is **`--relative=extern/<pkg>`**, which rewrites the diff paths so
 they apply at the upstream repo root instead of under `extern/<pkg>/`.
 
-For `mtlmesh`, the two fixes (`8b556f0a`, `417cb8b2`) are **not contiguous** in
+For `mtlmesh`, the two fixes (`13aae6c1`, `b21ac995`) are **not contiguous** in
 history, so emit them as separate single-commit patches and `git am` both in the
 order you want (oldest first):
 
 ```bash
-git -C /Users/pawelma/code/ai/Pixal3D format-patch -1 417cb8b2 --relative=extern/mtlmesh --stdout > /tmp/mtlmesh-1-volatile.patch
-git -C /Users/pawelma/code/ai/Pixal3D format-patch -1 8b556f0a --relative=extern/mtlmesh --stdout > /tmp/mtlmesh-2-hash-cas.patch
+git -C /Users/pawelma/code/ai/Pixal3D format-patch -1 b21ac995 --relative=extern/mtlmesh --stdout > /tmp/mtlmesh-1-volatile.patch
+git -C /Users/pawelma/code/ai/Pixal3D format-patch -1 13aae6c1 --relative=extern/mtlmesh --stdout > /tmp/mtlmesh-2-hash-cas.patch
 git am /tmp/mtlmesh-1-volatile.patch /tmp/mtlmesh-2-hash-cas.patch
 ```
 
-### `o_voxel` (special case)
+### `o_voxel` (upstream is a subdirectory)
 
-`extern/o_voxel` was **not** subtree-vendored — it's a plain-file copy of the
-`o-voxel/` subdirectory of
+`extern/o_voxel` is a plain-file copy of the `o-voxel/` **subdirectory** of
 [pedronaugusto/trellis2-apple](https://github.com/pedronaugusto/trellis2-apple)
-@ `6055b86` (subtree can't cleanly extract a single remote subdirectory). To
+@ `6055b86`. Because upstream lives in a subdir of a larger repo (not at the repo
+root like the `mtl*` packages), `format-patch --relative` doesn't line up — to
 upstream anything here, diff `extern/o_voxel` against that subdir in a fresh
 `trellis2-apple` clone and apply the delta by hand. (Most Pixal3D-side `o_voxel`
 behaviour lives in `pixal3d/utils/o_voxel_native_export.py`, not in the vendored
