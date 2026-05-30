@@ -27,17 +27,19 @@ DEFAULT_LAYOUT = {
 
 OUTPUT_TRANSFORMS = {
     "o_voxel": np.eye(4, dtype=np.float64),
-    # Native o_voxel writes q=(x, z, -y).  Empirical Blender check vs the
-    # ground-truth Pixal3D upstream output shows we need an additional
-    # scale_Y(-1) and a 180° rotation around the axis (0, 1/√2, -1/√2)
-    # (quaternion wxyz=(0, 0, 1/√2, -1/√2)) applied on top of the previous
-    # (x, -z, -y) conversion.  Composing them collapses to a pure 180°
-    # rotation around world Y: (x, y, z) -> (-x, y, -z).  Pure rotation
-    # (det=+1) so the face-winding flip below is skipped automatically.
+    # Native o_voxel writes the mesh tipped onto its side: in glTF's Y-up
+    # frame the model's true "up" axis comes out along +Z (a standing
+    # character is Z-tall, not Y-tall), so every viewer shows it lying down.
+    # The transform that stands it upright is a -90° rotation about X,
+    # (x, y, z) -> (-x, -z, -y), composed with o_voxel's prior conversion.
+    # This is the same correction users were applying by hand in Blender
+    # (quaternion wxyz=(1/√2, -1/√2, 0, 0)); baking it here means the GLB is
+    # correct in any Y-up glTF viewer without a manual post-rotation.
+    # Pure rotation (det=+1), so the face-winding flip below is skipped.
     "pixal3d": np.array([
         [-1, 0,  0, 0],
-        [ 0, 1,  0, 0],
         [ 0, 0, -1, 0],
+        [ 0, -1, 0, 0],
         [ 0, 0,  0, 1],
     ], dtype=np.float64),
     # Pure inverse of o_voxel's final q=(x, z, -y) conversion, useful for
