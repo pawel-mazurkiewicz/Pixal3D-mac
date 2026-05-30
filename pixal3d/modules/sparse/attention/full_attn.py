@@ -229,23 +229,83 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out, _ = flash_attn_4_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)
-    elif config.ATTN == 'sdpa':
-        from torch.nn.functional import scaled_dot_product_attention as _sdpa
+    elif config.ATTN in ('sdpa', 'naive'):
+        from torch.nn.functional import scaled_dot_product_attention
+        import os as _os
+
+        # S21: MPS scaled_dot_product_attention uses fp16 accumulators on bf16/fp16
+        # inputs (and possibly even on fp32 due to internal MPSGraph optimizations),
+        # which diverges from CUDA's fp32 accumulators in cuDNN flash attention.
+        # PIXAL3D_FP32_ATTN=1 upcasts q/k/v to fp32 around the SDPA call to force
+        # fp32 reductions on MPS. Costs ~2x memory + a bit of bandwidth, no kernel work.
+        _fp32_attn = _os.environ.get("PIXAL3D_FP32_ATTN", "").strip() in ("1", "true", "yes")
+
         if num_all_args == 1:
-            q, k, v = qkv.unbind(dim=1)   # [T, H, C] each
+            q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
-            k, v = kv.unbind(dim=1)        # [T_KV, H, C] each
-        # process each batch element independently (no varlen kernel needed)
-        q_offs  = [0] + list(torch.cumsum(torch.tensor(q_seqlen),  dim=0).tolist())
-        kv_offs = [0] + list(torch.cumsum(torch.tensor(kv_seqlen), dim=0).tolist())
-        outs = []
-        for i in range(len(q_seqlen)):
-            qi = q[q_offs[i]:q_offs[i+1]].unsqueeze(0).permute(0, 2, 1, 3)    # [1, H, Lq,  C]
-            ki = k[kv_offs[i]:kv_offs[i+1]].unsqueeze(0).permute(0, 2, 1, 3)  # [1, H, Lkv, C]
-            vi = v[kv_offs[i]:kv_offs[i+1]].unsqueeze(0).permute(0, 2, 1, 3)  # [1, H, Lkv, C]
-            out_i = _sdpa(qi, ki, vi)                                            # [1, H, Lq,  C]
-            outs.append(out_i.permute(0, 2, 1, 3).squeeze(0))                   # [Lq, H, C]
-        out = torch.cat(outs, dim=0)                                             # [T_Q, H, C]
+            k, v = kv.unbind(dim=1)
+
+        batch_size = len(q_seqlen)
+        heads = q.shape[-2]
+        q_channels = q.shape[-1]
+        v_channels = v.shape[-1]
+        max_q_len = max(q_seqlen)
+        max_kv_len = max(kv_seqlen)
+
+        q_padded = torch.zeros(batch_size, max_q_len, heads, q_channels, device=device, dtype=q.dtype)
+        k_padded = torch.zeros(batch_size, max_kv_len, heads, q_channels, device=device, dtype=k.dtype)
+        v_padded = torch.zeros(batch_size, max_kv_len, heads, v_channels, device=device, dtype=v.dtype)
+
+        q_offset = 0
+        kv_offset = 0
+        for batch_idx, (q_len, kv_len) in enumerate(zip(q_seqlen, kv_seqlen)):
+            q_padded[batch_idx, :q_len] = q[q_offset:q_offset + q_len]
+            k_padded[batch_idx, :kv_len] = k[kv_offset:kv_offset + kv_len]
+            v_padded[batch_idx, :kv_len] = v[kv_offset:kv_offset + kv_len]
+            q_offset += q_len
+            kv_offset += kv_len
+
+        q_padded = q_padded.permute(0, 2, 1, 3)
+        k_padded = k_padded.permute(0, 2, 1, 3)
+        v_padded = v_padded.permute(0, 2, 1, 3)
+
+        if config.ATTN == 'naive':
+            # S26: MPS's fused scaled_dot_product_attention kernel is numerically
+            # wrong for the DiT's real (post-RMSNorm/RoPE) q/k/v — per-element errors
+            # up to ~28 and per-call std off by several %, even in fp32.  Across the
+            # 30 residual blocks of the shape/tex flow DiTs this compounds into a
+            # systematic variance collapse of the sampled latents (geometry
+            # shrinkage + perforation + colour death).  The identical SDPA code path
+            # is bit-exact on CUDA and on CPU; only the MPS fused kernel diverges.
+            # Computing attention explicitly with matmul + softmax in fp32 matches
+            # CPU/CUDA to ~1e-6 (verified op-by-op).  Chunk over queries to avoid
+            # materialising the full [B,H,Lq,Lkv] score matrix (OOM at HR token
+            # counts).  Batch is 1 in inference (no padding), so the maskless padded
+            # layout is exact here.
+            import math as _math
+            _orig_dtype = q_padded.dtype
+            scale = 1.0 / _math.sqrt(q_channels)
+            qf = q_padded.float()
+            kt = k_padded.float().transpose(-2, -1)
+            vf = v_padded.float()
+            Bn, Hn, Lq, _ = qf.shape
+            out_padded = torch.empty(Bn, Hn, Lq, v_channels, device=qf.device, dtype=torch.float32)
+            _chunk = 2048
+            for _s in range(0, Lq, _chunk):
+                _e = min(_s + _chunk, Lq)
+                a = torch.matmul(qf[:, :, _s:_e], kt) * scale
+                a = a.softmax(dim=-1)
+                out_padded[:, :, _s:_e] = torch.matmul(a, vf)
+            out_padded = out_padded.to(_orig_dtype)
+        elif _fp32_attn:
+            _orig_dtype = q_padded.dtype
+            out_padded = scaled_dot_product_attention(
+                q_padded.float(), k_padded.float(), v_padded.float()
+            ).to(_orig_dtype)
+        else:
+            out_padded = scaled_dot_product_attention(q_padded, k_padded, v_padded)
+        out_padded = out_padded.permute(0, 2, 1, 3)
+        out = torch.cat([out_padded[i, :q_len] for i, q_len in enumerate(q_seqlen)], dim=0)
     else:
         raise ValueError(f"Unknown attention module: {config.ATTN}")
 

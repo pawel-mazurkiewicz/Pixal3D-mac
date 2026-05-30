@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "natten-mps"
+version = "0.1.0a0"
+description = "Metal/MPS backend for NATTEN (Neighborhood Attention Extension) on Apple Silicon."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pixal3D contributors" }]
+keywords = ["pytorch", "metal", "mps", "apple-silicon", "natten", "neighborhood-attention"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5",
+    "einops",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "natten>=0.21"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+filterwarnings = [
+    # natten 0.21 emits a UserWarning about the fused na2d default backend
+    # on import; harmless for our test paths.
+    "ignore::UserWarning",
+]
+
+[project.urls]
+Homepage = "https://github.com/pixal3d/natten-mps"
+Issues = "https://github.com/pixal3d/natten-mps/issues"
+
+[tool.setuptools.packages.find]
+include = ["natten_mps*"]
+
+[tool.setuptools.package-data]
+natten_mps = ["shaders/*.metal"]

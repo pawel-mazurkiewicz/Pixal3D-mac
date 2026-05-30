@@ -17,7 +17,22 @@ from .sparse_unet_vae import (
     SparseUnetVaeDecoder,
 )
 from ...representations import Mesh
-from o_voxel.convert import flexible_dual_grid_to_mesh
+try:
+    from o_voxel.convert import flexible_dual_grid_to_mesh as _native_flexible_dual_grid_to_mesh
+except (ImportError, RuntimeError, OSError):
+    _native_flexible_dual_grid_to_mesh = None
+from ...utils.mesh_extract import flexible_dual_grid_to_mesh as _torch_flexible_dual_grid_to_mesh
+
+
+def flexible_dual_grid_to_mesh(*args, **kwargs):
+    coords = args[0] if args else kwargs.get('coords')
+    if (
+        _native_flexible_dual_grid_to_mesh is not None
+        and isinstance(coords, torch.Tensor)
+        and coords.device.type == 'cuda'
+    ):
+        return _native_flexible_dual_grid_to_mesh(*args, **kwargs)
+    return _torch_flexible_dual_grid_to_mesh(*args, **kwargs)
 
 
 class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
@@ -100,11 +115,27 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
             intersected = h.replace(h.feats[..., 3:6] > 0)
             quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
-            mesh = [Mesh(*flexible_dual_grid_to_mesh(
-                v.coords[:, 1:], v.feats, i.feats, q.feats,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=self.resolution,
-                train=False
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+            mesh = []
+            for h_item, v, i, q in zip(h, vertices, intersected, quad_lerp):
+                fdg_coords = v.coords[:, 1:]
+                fdg_dual_vertices = v.feats
+                fdg_intersected = i.feats
+                fdg_split_weight = q.feats
+                mesh_item = Mesh(*flexible_dual_grid_to_mesh(
+                    fdg_coords, fdg_dual_vertices, fdg_intersected, fdg_split_weight,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    grid_size=self.resolution,
+                    train=False
+                ))
+                mesh_item.fdg_coords = fdg_coords
+                mesh_item.fdg_dual_vertices = fdg_dual_vertices
+                mesh_item.fdg_intersected = fdg_intersected
+                mesh_item.fdg_split_weight = fdg_split_weight
+                # Raw per-batch-item mid-decoder features (pre-sigmoid /
+                # pre-`>0` / pre-softplus split).  Captured so divergence at
+                # the FDG VAE decoder can be isolated from threshold-flip
+                # divergence on the boolean `intersected = feats[..., 3:6] > 0`.
+                mesh_item.fdg_h_feats = h_item.feats
+                mesh.append(mesh_item)
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)

@@ -134,12 +134,13 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         return pipeline
 
-    def to(self, device: torch.device) -> None:
+    def to(self, device: torch.device) -> "Pixal3DImageTo3DPipeline":
         self._device = device
         if not self.low_vram:
             super().to(device)
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
+        return self
 
     def preprocess_image(self, input: Image.Image, bg_color: tuple = (0, 0, 0)) -> Image.Image:
         """
@@ -589,20 +590,27 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
         out_mesh = []
-        torch.cuda.synchronize()
+        device_type = torch.device(self.device).type
+        if torch.cuda.is_available() and device_type == 'cuda':
+            torch.cuda.synchronize()
         for m, v in zip(meshes, tex_voxels):
-            m.fill_holes()
-            out_mesh.append(
-                MeshWithVoxel(
-                    m.vertices, m.faces,
-                    origin = [-0.5, -0.5, -0.5],
-                    voxel_size = 1 / resolution,
-                    coords = v.coords[:, 1:],
-                    attrs = v.feats,
-                    voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
-                    layout=self.pbr_attr_layout
-                )
+            if torch.cuda.is_available() and m.device.type == 'cuda':
+                m.fill_holes()
+            mesh_with_voxel = MeshWithVoxel(
+                m.vertices, m.faces,
+                origin = [-0.5, -0.5, -0.5],
+                voxel_size = 1 / resolution,
+                coords = v.coords[:, 1:],
+                attrs = v.feats,
+                voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
+                layout=self.pbr_attr_layout
             )
+            for attr in ("fdg_coords", "fdg_dual_vertices",
+                         "fdg_intersected", "fdg_split_weight",
+                         "fdg_h_feats"):
+                if hasattr(m, attr):
+                    setattr(mesh_with_voxel, attr, getattr(m, attr))
+            out_mesh.append(mesh_with_voxel)
         return out_mesh
     
     @torch.no_grad()
@@ -683,7 +691,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             num_samples, sparse_structure_sampler_params
         )
         del cond_ss
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ---- Stage 2: Shape LR 512 (proj) ----
         cond_shape_lr = self.get_proj_cond_shape(
@@ -697,7 +706,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             coords, shape_slat_sampler_params
         )
         del cond_shape_lr
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ---- Stage 3a: Upsample LR → HR ----
         if self.low_vram:
@@ -724,7 +734,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         actual_grid_res = actual_hr_resolution // 16
         del lr_slat, hr_coords, quant_coords
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ---- Stage 3b: Shape HR (proj) ----
         cond_shape_hr = self.get_proj_cond_shape(
@@ -756,7 +767,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(hr_slat.device)
         shape_slat = hr_slat * std + mean
         del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ---- Stage 4: Texture (proj) ----
         tex_grid_res = actual_hr_resolution // 16
@@ -772,7 +784,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             shape_slat, tex_slat_sampler_params
         )
         del cond_tex
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ---- Stage 5: Decode ----
         res = actual_hr_resolution

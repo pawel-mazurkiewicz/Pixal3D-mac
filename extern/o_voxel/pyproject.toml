@@ -1,0 +1,44 @@
+[build-system]
+requires = [
+    "setuptools>=64",
+    "wheel",
+    "torch",
+    "numpy",
+    "plyfile",
+    "trimesh",
+    "tqdm",
+    "zstandard",
+    "easydict"
+]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "o_voxel"
+version = "0.0.1"
+description = "All about voxel."
+requires-python = ">=3.8"
+authors = [
+    { name = "Jianfeng Xiang", email = "belljig@outlook.com" }
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "plyfile",
+    "trimesh",
+    "tqdm",
+    "zstandard",
+    "easydict",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cumesh",
+    "flex_gemm",
+]
+metal = [
+    "mtldiffrast",
+]
+cuda = [
+    "nvdiffrast",
+]

@@ -1,287 +1,235 @@
-
 <div align="center">
 
-# Pixal3D: Pixel-Aligned 3D Generation from Images
+# Pixal3D — Apple Silicon (MPS / Metal) Port
 
-<h3>SIGGRAPH 2026</h3>
+![alt text](assets/readme/image.png)
 
-<small>[Dong-Yang Li](https://ldyang694.github.io/)¹ · [Wang Zhao](https://thuzhaowang.github.io/)²* · [Yuxin Chen](https://orcid.org/0000-0002-7854-1072)² · [Wenbo Hu](https://wbhu.github.io/)² · [Meng-Hao Guo](https://menghaoguo.github.io/)¹ · [Fang-Lue Zhang](https://fanglue.github.io/)³ · [Ying Shan](https://www.linkedin.com/in/YingShanProfile)² · [Shi-Min Hu](https://cg.cs.tsinghua.edu.cn/shimin.htm)¹✉</small>
-
-¹Tsinghua University (BNRist) &nbsp;&nbsp; ²Tencent ARC Lab &nbsp;&nbsp; ³Victoria University of Wellington
-
-*Project lead &nbsp;&nbsp; ✉Corresponding author
+**Unofficial fork that runs [Pixal3D](https://ldyang694.github.io/projects/pixal3d/) image-to-3D generation on Apple Silicon Macs — no CUDA required.**
 
 </div>
 
 <div align="center">
-  <a href="https://ldyang694.github.io/projects/pixal3d/"><img src=https://img.shields.io/badge/Project%20Page-333399.svg?logo=googlehome height=22px></a>
-  <a href="https://huggingface.co/spaces/TencentARC/Pixal3D"><img src=https://img.shields.io/badge/%F0%9F%A4%97%20Demo-276cb4.svg height=22px></a>
+  <a href="https://ldyang694.github.io/projects/pixal3d/"><img src=https://img.shields.io/badge/Upstream%20Project-333399.svg?logo=googlehome height=22px></a>
   <a href="https://huggingface.co/TencentARC/Pixal3D"><img src=https://img.shields.io/badge/%F0%9F%A4%97%20Models-d96902.svg height=22px></a>
   <a href="https://arxiv.org/abs/2605.10922"><img src=https://img.shields.io/badge/Arxiv-b5212f.svg?logo=arxiv height=22px></a>
-  <a href="LICENSE"><img src=https://img.shields.io/badge/License-MIT-yellow.svg height=22px></a>
+  <img src=https://img.shields.io/badge/Apple%20Silicon-MPS%20%2B%20Metal-000000.svg?logo=apple height=22px>
 </div>
-
-<div align="center">
-    <img src="assets/teaser.png" alt="Teaser image of Pixal3D"/>
-</div>
-
-**Pixal3D** generates high-fidelity 3D assets from a single image. Unlike previous methods that loosely inject image features via attention, Pixal3D explicitly lifts pixel features into 3D through back-projection, establishing direct pixel-to-3D correspondences. This enables near-reconstruction-level fidelity with detailed geometry and PBR textures.
 
 ---
 
-## ✨ News
+## What this is
 
-- **May 2026**: Release training code and data preparation toolkit. 🔧
-- **May 2026**: Release the improved version based on [Trellis.2](https://github.com/microsoft/TRELLIS.2) backbone. 💪
-- **May 2026**: Release inference code and online demo. 🤗
-- **Apr 2026**: Our paper is accepted to SIGGRAPH 2026! 🎉
+This is a port of **Pixal3D** (Pixel-Aligned 3D Generation from Images,
+SIGGRAPH 2026, by Tsinghua University / Tencent ARC Lab / Victoria University of
+Wellington) to **Apple Silicon**. The upstream pipeline targets NVIDIA GPUs and
+depends on CUDA-only building blocks — `flash_attn`, `nvdiffrast`, fused
+neighborhood attention (`natten` cutlass kernels), `flex_gemm` sparse 3D
+convolutions, and the CUDA `o_voxel`/`cumesh` mesh post-processing kernels.
 
-## 📌 Branches
+This fork replaces every one of those with an Apple-native equivalent so the full
+single-image → textured GLB pipeline runs end-to-end on an M-series Mac using
+**MPS** (Metal Performance Shaders) and a set of hand-written / vendored **Metal**
+kernels. It is **not affiliated with or endorsed by** the original authors,
+Tencent, or Tsinghua University.
 
-| Branch | Description |
-|--------|-------------|
-| `main` | **Latest version** — improved implementation based on [Trellis.2](https://github.com/microsoft/TRELLIS.2) backbone with better performance. |
-| `paper` | **Paper version** — original implementation based on [Direct3D-S2](https://github.com/DreamTechAI/Direct3D-S2), corresponding to results reported in our SIGGRAPH 2026 paper. |
+> **Looking for the original?** The upstream README, model weights, online demo,
+> and paper are linked in the badges above. If you have an NVIDIA GPU, use upstream
+> — it is faster and is the reference implementation.
 
-> If you want to reproduce the results in our paper, please switch to the `paper` branch.
+### How it came about
 
-## 🎮 Try It Online
+The primary motivation is simple: CUDA and NVIDIA GPUs should not be a prerequisite for running open weight models created by state-of-the-art research. Apple Silicon Macs are powerful machines that are strongly underrepresented in the space — not because the hardware can't manage to do what Nvidia GPUs do, but because the ecosystem defaults to CUDA and rarely (if ever) ships Metal paths. This port is an attempt to change that for Pixal3D.
 
-You can try Pixal3D directly in your browser without any installation via our Hugging Face Gradio demo:
+Making that work in practice meant a long divergence-hunting investigation: get the
+pipeline running on Metal, then chase down every place where Apple's fp32 / MPS
+numerics or a missing kernel caused the mesh or texture to diverge from the CUDA
+reference. Several genuine bugs were found and fixed along the way (an MPS fused
+SDPA accuracy cliff above ~18k tokens, a Metal BVH traversal-stack overflow that
+broke the remesh on large meshes, a rasterizer depth-test mismatch, and more).
 
-👉 [**Launch Demo**](https://huggingface.co/spaces/TencentARC/Pixal3D)
+The full investigation history is preserved outside this repo in
+`../Pixal3D_investigation_docs/`. The two reference documents that remain in-tree
+are:
 
-## 🚀 Getting Started
+- **[`PIPELINE_MAP.md`](PIPELINE_MAP.md)** — ground-truth atlas of every stage,
+  model, monkey-patch, device-routing decision, env var, and known CUDA-vs-Mac
+  divergence. Open this first when you need to understand the runtime.
+- **[`INVESTIGATION_FACTS.md`](INVESTIGATION_FACTS.md)** — the facts-only ledger of
+  bugs found, fixed, and ruled out.
 
-### Installation
+## Status
 
-#### Step 1: Follow TRELLIS.2 Installation
+The pipeline runs end-to-end and produces watertight, textured GLB meshes whose
+geometry and PBR colour closely match the CUDA reference. Known residuals are
+small - intrinsic fp32-vs-TF32 reduction-order drift, minor thin-feature simplify holes, honest small difference between implementations.
 
-Please first follow the installation guide of [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) to set up the base environment.
+## Requirements
 
-#### Step 2: Install Additional Dependencies
+- **Apple Silicon Mac** (M3 or newer). Intel Macs are not supported.
+Two kernels in mtlmesh use native float atomics that only exist on Apple9+ (M3 and newer):
+  - simplify.metal — atomic_min/atomic_max on floats
+  - atlas.metal — atomic_float
+- **macOS** recent enough to provide the Metal toolchain (tested on macOS 14+).
+- **Xcode Command Line Tools** — required. The vendored Metal packages compile
+  `.metal` shaders to `.metallib` **at install time** using `xcrun metal`, so the
+  Metal toolchain must be present *before* you run setup:
 
-```bash
-pip install -r requirements.txt
-```
+  ```bash
+  xcode-select --install        # if not already installed
+  xcrun --find metal            # should print a path, not an error
+  ```
 
-#### Step 3: Install natten
+  (A full Xcode install also works and is required on some macOS versions for the
+  Metal compiler.)
+- **Python 3.10**, recommended via Homebrew: `brew install python@3.10`.
+  3.10 matches the upstream Pixal3D / CUDA reference environment; `requirements-mac.txt`
+  is pinned against it (e.g. `numpy<2.3`, which dropped 3.10 in 2.4+).
+- Disk space for the model weights, which are pulled from Hugging Face
+  (`TencentARC/Pixal3D`) on first run.
 
-```bash
-NATTEN_CUDA_ARCH="xx" NATTEN_N_WORKERS=xx pip install natten==0.21.0 --no-build-isolation
-```
+## Author setup
 
-Please replace `xx` with the CUDA architecture and the number of build workers suitable for your machine.
+The port was developed and tested on MacBook Pro 16" M5 Max with 128GB of unified memory and 40 core GPU.
 
-#### Step 4: Install utils3d
+## Setup
 
-```bash
-pip install https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl
-```
-
-> **Note**: `requirements-hfdemo.txt` is for the Hugging Face Spaces demo (H-series GPU architecture) and may not be compatible with other architectures.
-
-### Usage
-
-#### Inference
-
-Generate a GLB mesh from a single image:
-
-```bash
-python inference.py --image assets/images/0_img.png --output ./output.glb
-```
-
-**Low-VRAM mode** (reduces peak VRAM by loading models on-demand):
-
-```bash
-python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
-```
-
-By default, the pipeline resolution is **1536** (standard mode) or **1024** (low-VRAM mode). You can override this with `--resolution`:
-
-```bash
-# Force 1536 even in low-VRAM mode
-python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram --resolution 1536
-
-# Force 1024 in standard mode
-python inference.py --image assets/images/0_img.png --output ./output.glb --resolution 1024
-```
-
-**Tip**: If you don't have `flash_attn` installed, you can use PyTorch's built-in SDPA backend instead:
-> ```bash
-> ATTN_BACKEND=sdpa python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
-> ```
-
-### Web Demo
-
-We provide a Gradio web demo for Pixal3D, which allows you to generate 3D meshes from images interactively.
+### Option A — one-shot script (recommended)
 
 ```bash
-python app.py 
+./scripts/setup_mac.sh
 ```
 
-Low-VRAM mode is also available for the web demo. The frontend default resolution will automatically switch to 1024 in low-VRAM mode (1536 otherwise), but can be changed manually in the UI.
+This creates a `.venv` (Python 3.10), installs the pinned Mac dependencies, and
+editable-installs the six vendored native packages in `extern/` (compiling their
+Metal kernels). Re-run it any time; it is idempotent.
+
+### Option B — manual
 
 ```bash
-python app.py --low_vram
-# or via environment variable:
-LOW_VRAM=1 python app.py
-```
-## 🔧 Training
+# 1. Create and populate the venv
+/opt/homebrew/opt/python@3.10/bin/python3.10 -m venv .venv
+.venv/bin/pip install -U pip wheel setuptools
+.venv/bin/pip install -r requirements-mac.txt        # or: uv pip install --python .venv/bin/python -r requirements-mac.txt
 
-We provide the full training codebase for reproducing Pixal3D from scratch.
-
-### Data Preparation
-
-Prepare view-aligned O-Voxel data and rendered condition images by following the data toolkit instructions:
-
-> 📂 **[data_toolkit/README.md](data_toolkit/README.md)**
-
-### Overview
-
-Pixal3D is trained as a three-stage cascade, each progressively increasing resolution:
-
-| Stage | Model | Resolutions | Config Prefix |
-|-------|-------|-------------|---------------|
-| 1 | Sparse Structure | 32 → 64 | `ss_flow_img_dit_*_proj_finetune` |
-| 2 | Shape | 256 → 512 → 1024 | `slat_flow_img2shape_*_proj_finetune` |
-| 3 | Texture | 256 → 512 → 1024 | `slat_flow_imgshape2tex_*_proj_finetune` |
-
-All stages use **pixel-aligned projection conditioning** and **view-aligned latents** (2 views by default). Within each stage, start from the lowest resolution and progressively fine-tune to higher resolutions by setting `finetune_ckpt` in the config.
-
-### Quick Start
-
-```sh
-python train.py \
-  --config <CONFIG_JSON> \
-  --output_dir <OUTPUT_DIR> \
-  --data_dir '<DATA_DIR_JSON>'
+# 2. Build + install the vendored native Metal packages (compiles .metal -> .metallib)
+for pkg in mtlmesh mtlgemm mtlbvh mtldiffrast o_voxel natten-mps; do
+  .venv/bin/pip install -e extern/$pkg --no-build-isolation
+done
 ```
 
-`--data_dir` is a JSON string describing the dataset layout. Different stages require different keys:
+`--no-build-isolation` is required: some packages (notably `mtlgemm`) have
+link-time / rpath quirks that PEP 517's isolated build environment doesn't satisfy.
 
-| Stage | Required keys |
-|-------|---------------|
-| Sparse Structure | `base`, `ss_latent`, `render_cond` |
-| Shape | `base`, `shape_latent`, `render_cond` |
-| Texture | `base`, `shape_latent`, `pbr_latent`, `render_cond` |
+See [`extern/README.md`](extern/README.md) for what each vendored package provides
+and how it maps to the CUDA dependency it replaces.
 
-### Example: Training All Three Stages
+## Usage
 
-Below we show the full training sequence using ObjaverseXL as an example. Each higher-resolution step requires updating `finetune_ckpt` in its config JSON to point to the previous checkpoint.
+Generate a textured GLB from a single image:
 
-<details>
-<summary><b>Stage 1: Sparse Structure (32 → 64)</b></summary>
-
-```sh
-# Resolution 32
-python train.py \
-  --config configs/gen/ss_flow_img_dit_1_3B_32_bf16_proj_finetune.json \
-  --output_dir results/ss_32 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "ss_latent": "datasets/ObjaverseXL_sketchfab/ss_latents/ss_enc_conv3d_16l8_fp16_64_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
-
-# Resolution 64 (set finetune_ckpt → results/ss_32 checkpoint)
-python train.py \
-  --config configs/gen/ss_flow_img_dit_1_3B_32_bf16_proj_finetune_ft64.json \
-  --output_dir results/ss_ft64 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "ss_latent": "datasets/ObjaverseXL_sketchfab/ss_latents/ss_enc_conv3d_16l8_fp16_64_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
+```bash
+.venv/bin/python generate_mps.py assets/images/0_img.png --output output_3d.glb
 ```
-</details>
 
-<details>
-<summary><b>Stage 2: Shape (256 → 512 → 1024)</b></summary>
+Common options:
 
-```sh
-# Resolution 256
-python train.py \
-  --config configs/gen/slat_flow_img2shape_dit_1_3B_256_bf16_proj_finetune.json \
-  --output_dir results/shape_256 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "shape_latent": "datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_256_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
+| Flag | Default | Purpose |
+|---|---|---|
+| `--output PATH` | `output_3d` | Output GLB path / basename |
+| `--seed N` | `42` | Random seed |
+| `--pipeline-type` | `1024_cascade` | `1024_cascade` or `1536_cascade` |
+| `--texture-size` | `2048` | Baked texture resolution (512–4096) |
+| `--native-remesh` / `--no-native-remesh` | on | Narrow-band dual-contour remesh (watertight, matches CUDA). Off falls back to the simplify-sieve path |
+| `--no-texture` | off | Geometry-only GLB |
+| `--fov F` | auto (MoGe-2) | Override estimated camera FOV |
 
-# Resolution 512
-python train.py \
-  --config configs/gen/slat_flow_img2shape_dit_1_3B_256_bf16_proj_finetune_ft512.json \
-  --output_dir results/shape_ft512 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "shape_latent": "datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_512_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
+`generate_mps.py --help` lists the full set. Runtime behaviour is also controllable
+through a large set of `PIXAL3D_*` environment variables (fp32 model casts, attention
+backend, device pinning, the native cleanup chain, diagnostics) — these are
+catalogued exhaustively in [`PIPELINE_MAP.md §7`](PIPELINE_MAP.md).
 
-# Resolution 1024
-python train.py \
-  --config configs/gen/slat_flow_img2shape_dit_1_3B_512_bf16_proj_finetune_ft1024.json \
-  --output_dir results/shape_ft1024 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "shape_latent": "datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_1024_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
-```
-</details>
+The production numerics recipe (matches the CUDA reference most closely) is already
+the default; you do **not** need to set any env vars for a normal run.
 
-<details>
-<summary><b>Stage 3: Texture (256 → 512 → 1024)</b></summary>
+## Performance
 
-```sh
-# Resolution 256
-python train.py \
-  --config configs/gen/slat_flow_imgshape2tex_dit_1_3B_256_bf16_proj_finetune.json \
-  --output_dir results/tex_256 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "shape_latent": "datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_256_view", "pbr_latent": "datasets/ObjaverseXL_sketchfab/pbr_latents/tex_enc_next_dc_f16c32_fp16_256_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
+Expect a single 1024-cascade generation to take several minutes on an M-series Mac. A 1536_cascade pipelines took up to 50 minutes (at 2048x2048 texture resolution) on my M5 Max - YMMV.
 
-# Resolution 512
-python train.py \
-  --config configs/gen/slat_flow_imgshape2tex_dit_1_3B_512_bf16_proj_finetune.json \
-  --output_dir results/tex_512 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "shape_latent": "datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_512_view", "pbr_latent": "datasets/ObjaverseXL_sketchfab/pbr_latents/tex_enc_next_dc_f16c32_fp16_512_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
+This is non-exhaustive list of metrics for evaluations done:
 
-# Resolution 1024
-python train.py \
-  --config configs/gen/slat_flow_imgshape2tex_dit_1_3B_512_bf16_proj_finetune_ft1024.json \
-  --output_dir results/tex_ft1024 \
-  --data_dir '{"ObjaverseXL_sketchfab": {"base": "datasets/ObjaverseXL_sketchfab", "shape_latent": "datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_1024_view", "pbr_latent": "datasets/ObjaverseXL_sketchfab/pbr_latents/tex_enc_next_dc_f16c32_fp16_1024_view", "render_cond": "datasets/ObjaverseXL_sketchfab/renders_cond"}}'
-```
-</details>
+![performance](assets/readme/performance.png)
 
-### Additional Options
+## How it works (architecture)
 
-<details>
-<summary><b>All command-line arguments</b></summary>
+The Mac pipeline is the upstream Pixal3D pipeline with CUDA building blocks swapped
+for Apple-native ones. The native replacements are vendored in `extern/` and
+imported in-process:
 
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--config` | Config JSON path | *required* |
-| `--output_dir` | Output directory | *required* |
-| `--data_dir` | Dataset JSON string | `./data/` |
-| `--load_dir` | Checkpoint load directory | `output_dir` |
-| `--ckpt` | Resume from step | `latest` |
-| `--auto_retry` | Retries on failure | `3` |
-| `--tryrun` | Dry run | `false` |
-| `--profile` | Profiling | `false` |
-| `--num_nodes` | Number of nodes | `1` |
-| `--node_rank` | Current node rank | `0` |
-| `--num_gpus` | GPUs per node | all |
-| `--master_addr` | Master address | `localhost` |
-| `--master_port` | Master port | `12666` |
-| `--use_wandb` | Enable W&B logging | `false` |
-| `--wandb_project` | W&B project | `trellis2-training` |
-| `--wandb_name` | W&B run name | basename of `output_dir` |
-| `--wandb_id` | W&B run ID (resume) | — |
+| `extern/` package | Replaces (CUDA) | Provides |
+|---|---|---|
+| `mtlmesh` (`cumesh`) | CUDA `cumesh` | Metal mesh post-processing: simplify (QEM), hole-fill, NME repair, dedup, unify, dual-contour remesh |
+| `mtlgemm` (`flex_gemm`) | CUDA `flex_gemm` | Metal sparse Conv3D + `grid_sample_3d` |
+| `mtlbvh` | — | Metal BVH ray/closest-triangle queries (drives the remesh UDF) |
+| `mtldiffrast` | `nvdiffrast` | Metal differentiable rasterizer (texture bake) |
+| `o_voxel` | CUDA `o_voxel` | Mesh extraction + texture-bake post-process (`to_glb`) |
+| `natten-mps` | `natten` cutlass-fna | Metal neighborhood attention for the NAF upsampler |
 
-</details>
+On top of that, `generate_mps.py` installs a set of monkey-patches at startup
+(attention shims, device routing, a pure-Python replacement for the CUDA-only FDG
+hashmap, fp32 upcasts, the `naive` chunked-fp32 sparse-attention backend that works
+around the MPS SDPA cliff). All of this is documented stage-by-stage in
+`PIPELINE_MAP.md §3–§5`.
 
-## 🌐 Community Projects
+## Evaluations
 
-We thank the community for building extensions and deployment guides for Pixal3D!
+I did some evaluations of the port against the images that ships with official Pixal3D, here are some of them:
 
-- [Pixal3D-ComfyUI](https://github.com/Saganaki22/Pixal3D-ComfyUI) — ComfyUI integration with deployment guides for Windows, WSL, and more.
+![eval-1](assets/readme/eval-1.png)
+![eval-2](assets/readme/eval-2.png)
+![eval-3](assets/readme/eval-3.png)
+![eval-4](assets/readme/eval-4.png)
+![eval-5](assets/readme/eval-5.png)
+![eval-6](assets/readme/eval-6.png)
+![eval-7](assets/readme/eval-7.png)
+![eval-8](assets/readme/eval-8.png)
+![eval-9](assets/readme/eval-9.png)
+![eval-10](assets/readme/eval-10.png)
+![eval-11](assets/readme/eval-11.png)
+![eval-12](assets/readme/eval-12.png)
+![eval-13](assets/readme/eval-13.png)
+
+
+## Contributing fixes upstream
+
+Several of the fixes in this fork are genuine bugs in the underlying native
+libraries and should be sent back to their upstreams (Pedro Naugusto's `mtl*`
+packages and our own `natten-mps`). The per-package change inventory and the PR
+workflow are written up in **[`extern/UPSTREAMING.md`](extern/UPSTREAMING.md)**.
 
 ## 🤗 Acknowledgements
 
-This project is heavily built upon [Trellis.2](https://github.com/microsoft/TRELLIS.2) and [Direct3D-S2](https://github.com/DreamTechAI/Direct3D-S2). We sincerely thank the authors for their outstanding work on scalable 3D generation , which serves as the foundation of our codebase and model architecture.
+This port stands on:
 
-We also thank the following repos for their great contributions:
-
-- [Direct3D-S2](https://github.com/DreamTechAI/Direct3D-S2)
-- [Trellis](https://github.com/microsoft/TRELLIS)
-- [Trellis.2](https://github.com/microsoft/TRELLIS.2)
+- **[Pixal3D](https://ldyang694.github.io/projects/pixal3d/)** — the original work
+  by Dong-Yang Li, Wang Zhao, Yuxin Chen, Wenbo Hu, Meng-Hao Guo, Fang-Lue Zhang,
+  Ying Shan, and Shi-Min Hu (Tsinghua University / Tencent ARC Lab / Victoria
+  University of Wellington), built on
+  [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) and
+  [Direct3D-S2](https://github.com/DreamTechAI/Direct3D-S2).
+- **[Pedro Naugusto](https://github.com/pedronaugusto)'s Metal libraries**
+  ([mtlmesh](https://github.com/pedronaugusto/mtlmesh),
+  [mtlgemm](https://github.com/pedronaugusto/mtlgemm),
+  [mtlbvh](https://github.com/pedronaugusto/mtlbvh),
+  [mtldiffrast](https://github.com/pedronaugusto/mtldiffrast),
+  [trellis2-apple](https://github.com/pedronaugusto/trellis2-apple)) — the
+  Apple-native mesh / GEMM / BVH / rasterizer kernels this port depends on.
+- [TRELLIS](https://github.com/microsoft/TRELLIS),
+  [TRELLIS.2](https://github.com/microsoft/TRELLIS.2), and
+  [Direct3D-S2](https://github.com/DreamTechAI/Direct3D-S2).
 
 ## 📄 Citation
 
-If you find this work useful, please consider citing:
+If you use the model, please cite the original Pixal3D paper:
 
 ```bibtex
 @article{li2026pixal3d,
@@ -292,7 +240,7 @@ If you find this work useful, please consider citing:
 }
 ```
 
-## 📜 License
+## License
 
-This project is released under the [MIT License](LICENSE). The third-party components included in this project remain licensed under their respective original terms; see [NOTICE](NOTICE) for the full list of dependencies and their licenses.
+This fork inherits the upstream Pixal3D MIT license (see [`LICENSE`](LICENSE)). The vendored `extern/` packages carry their own licenses in their respective subdirectories.
 

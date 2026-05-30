@@ -6,16 +6,37 @@ __pycache__/
 
 # Output files
 output.glb
+output_3d*.glb
+output_3d*.obj
 autotune_cache.json
+
+# Local iteration artefacts (kept out of git so checkpoints / debug dumps
+# don't get committed by accident — they're regenerated on demand)
+checkpoints/
+xatlas.txt
+*_basecolor*.png
+
+# Phase-6-style experiment dumps (large .glb / log artefacts)
+scratch/
+
+# OMC / session state
+.omc/
+.claude/
+.rag/
 
 # Virtual environment
 venv/
 .venv/
+.venv-*/
 env/
+
+# CUDA bisection harness — connection config holds rental host/port
+scripts/cuda/.env
 
 # IDE
 .idea/
 .vscode/
+.serena/
 *.swp
 *.swo
 
@@ -24,3 +45,11 @@ env/
 Thumbs.db
 
 tmp
+
+# Outputs
+*.glb
+
+# AI Junk
+.codex/
+.agents/
+.claude/

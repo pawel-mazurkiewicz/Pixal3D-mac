@@ -411,23 +411,42 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         self.proj_channels = self.embed_dim * 2 if use_naf_upsample else self.embed_dim
         
         # NOTE: proj_linear removed — now lives in each denoiser block's ProjectAttention
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.model.parameters()).device
     
     def _load_naf(self):
-        """Lazy-load pretrained NAF model."""
+        """Lazy-load pretrained NAF model.
+
+        Diagnostic: ``PIXAL3D_NAF_DEVICE`` env var (e.g. ``cpu``) forces NAF
+        onto a different device than the rest of the extractor.  Used to
+        isolate NAF-on-MPS as the source of the z_proj divergence vs CUDA.
+        The forward path ferries inputs/outputs between devices when this
+        diverges from the DINOv3 device.
+        """
         if self.naf_model is None:
             import torch.hub
+            import os as _os
             device = next(self.model.parameters()).device
+            override = _os.environ.get("PIXAL3D_NAF_DEVICE", "").strip()
+            if override:
+                device = torch.device(override)
+                print(f"[NAF] PIXAL3D_NAF_DEVICE={override}: forcing NAF onto {device}",
+                      flush=True)
             self.naf_model = torch.hub.load(
                 "valeoai/NAF", "naf", pretrained=True, device=device, trust_repo=True
             )
             self.naf_model.eval()
             self.naf_model.requires_grad_(False)
-        
+            # Pin so subsequent .to()/.cuda()/.cpu() don't undo the override.
+            self._naf_device_pinned = bool(override)
+
     def to(self, device):
         super().to(device)
         self.model.to(device)
         self.proj_grid.to(device)
-        if self.naf_model is not None:
+        if self.naf_model is not None and not getattr(self, "_naf_device_pinned", False):
             self.naf_model.to(device)
         return self
 
@@ -435,7 +454,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         super().cuda()
         self.model.cuda()
         self.proj_grid.cuda()
-        if self.naf_model is not None:
+        if self.naf_model is not None and not getattr(self, "_naf_device_pinned", False):
             self.naf_model.cuda()
         return self
 
@@ -443,7 +462,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         super().cpu()
         self.model.cpu()
         self.proj_grid.cpu()
-        if self.naf_model is not None:
+        if self.naf_model is not None and not getattr(self, "_naf_device_pinned", False):
             self.naf_model.cpu()
         return self
     
@@ -453,7 +472,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for layer_module in self.model.layer:
+        layers = self.model.model.layer if hasattr(self.model, 'model') and hasattr(self.model.model, 'layer') else self.model.layer
+        for layer_module in layers:
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -488,12 +508,13 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         # Handle input types
         if isinstance(image, torch.Tensor):
             assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
+            image = image.to(self.device)
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -538,19 +559,54 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 self._load_naf()
                 # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
                 lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
+                # If PIXAL3D_NAF_DEVICE pinned NAF to a different device than
+                # the DINOv3 inputs, ferry tensors across.  Diagnostic only.
+                _naf_device = next(self.naf_model.parameters()).device
+                _orig_device = lr_features_bchw.device
+                if _naf_device != _orig_device:
+                    image_for_naf = image_for_naf.to(_naf_device)
+                    lr_features_bchw = lr_features_bchw.to(_naf_device)
                 hr_features = self.naf_model(
                     image_for_naf, lr_features_bchw, self.naf_target_size
                 )  # [B, D, H', W']
+                if _naf_device != _orig_device:
+                    hr_features = hr_features.to(_orig_device)
                 
-                # Sample from high-res feature map using same projection coordinates
-                z_proj_hr = self.proj_grid(
-                    hr_features,
-                    camera_angle_x,
-                    distance,
-                    mesh_scale,
-                    transform_matrix,
-                    BHWC=False  # hr_features is [B, C, H', W']
-                )  # [B, grid_res³, D]
+                # Sample from high-res feature map using same projection coordinates.
+                # Diagnostic: ``PIXAL3D_PROJ_GRID_DEVICE`` env var (e.g. ``cpu``)
+                # forces the HR proj_grid call (including F.grid_sample) onto a
+                # different device than the rest of the extractor.  Used to
+                # isolate MPS grid_sample as the source of the residual z_proj
+                # divergence vs CUDA after NAF has been moved to CPU.
+                import os as _os
+                _pg_override = _os.environ.get("PIXAL3D_PROJ_GRID_DEVICE", "").strip()
+                if _pg_override:
+                    _pg_device = torch.device(_pg_override)
+                    if not hasattr(self, "_proj_grid_alt") or self._proj_grid_alt is None \
+                            or next(iter(self._proj_grid_alt.buffers())).device != _pg_device:
+                        import copy as _copy
+                        self._proj_grid_alt = _copy.deepcopy(self.proj_grid).to(_pg_device)
+                        print(f"[ProjGrid] PIXAL3D_PROJ_GRID_DEVICE={_pg_override}: "
+                              f"HR proj_grid pinned to {_pg_device}", flush=True)
+                    _hr_orig_device = hr_features.device
+                    _hr_in = hr_features.to(_pg_device)
+                    _cax = camera_angle_x.to(_pg_device)
+                    _dst = distance.to(_pg_device)
+                    _msc = mesh_scale.to(_pg_device)
+                    _tm = transform_matrix.to(_pg_device) if transform_matrix is not None else None
+                    z_proj_hr = self._proj_grid_alt(
+                        _hr_in, _cax, _dst, _msc, _tm, BHWC=False
+                    )
+                    z_proj_hr = z_proj_hr.to(_hr_orig_device)
+                else:
+                    z_proj_hr = self.proj_grid(
+                        hr_features,
+                        camera_angle_x,
+                        distance,
+                        mesh_scale,
+                        transform_matrix,
+                        BHWC=False  # hr_features is [B, C, H', W']
+                    )  # [B, grid_res³, D]
                 
                 # Concatenate lr and hr: [B, grid_res³, D*2]
                 z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)
@@ -667,6 +723,10 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         self.vae_proj_channels = self.vae_channels     # 16
         # proj_channels is kept for backward compat with _proj_channels in mixin
         self.proj_channels = self.embed_dim
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.dino_model.parameters()).device
         
     def _load_vae(self):
         """Lazy-load Flux VAE encoder."""
@@ -713,7 +773,8 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         image = image.to(self.dino_model.embeddings.patch_embeddings.weight.dtype)
         hidden_states = self.dino_model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.dino_model.rope_embeddings(image)
-        for layer_module in self.dino_model.layer:
+        layers = self.dino_model.model.layer if hasattr(self.dino_model, 'model') and hasattr(self.dino_model.model, 'layer') else self.dino_model.layer
+        for layer_module in layers:
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -751,12 +812,13 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         # Handle input types
         if isinstance(image, torch.Tensor):
             assert image.ndim == 4
+            image = image.to(self.device)
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image)
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
