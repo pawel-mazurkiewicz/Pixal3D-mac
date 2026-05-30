@@ -1751,6 +1751,8 @@ def try_export_native_o_voxel_glb(mesh, resolution: int, vertices: np.ndarray, f
             cmd.extend(["--small-cc-threshold", str(args.native_small_cc_threshold)])
         if args.native_fill_holes_perimeter is not None:
             cmd.extend(["--fill-holes-perimeter", str(args.native_fill_holes_perimeter)])
+        if args.fill_holes_before_uv and args.fill_holes_before_uv_perimeter > 0:
+            cmd.extend(["--fill-holes-before-uv-perimeter", str(args.fill_holes_before_uv_perimeter)])
         if args.native_simplify_impl != "metal":
             cmd.extend(["--simplify-impl", args.native_simplify_impl])
         # ---- S17b: compute_charts bisection + knob overrides ----
@@ -2259,6 +2261,17 @@ def parse_args():
                         help="Pre-smooth pipeline mesh before bridge (Taubin recommended).")
     parser.add_argument("--presmooth-iterations", type=int, default=5,
                         help="Smoothing iterations (default 5).")
+    parser.add_argument("--fill-holes-before-uv", action=argparse.BooleanOptionalAction, default=False,
+                        help="OPTIONAL watertight enhancement (off by default; NOT faithful to the "
+                             "CUDA reference). On the native path, run an extra fill_holes right "
+                             "before UV unwrap (xatlas chart counting), closing thin-feature holes "
+                             "the post-simplify chain misses. Because it runs pre-UV, patches get "
+                             "texture and the chart count drops. Perimeter set by "
+                             "--fill-holes-before-uv-perimeter.")
+    parser.add_argument("--fill-holes-before-uv-perimeter", type=float, default=0.1,
+                        help="max_hole_perimeter for --fill-holes-before-uv (default 0.1, ~3x the "
+                             "chain's built-in 3e-2). Larger closes bigger holes but may seal "
+                             "legitimate openings (mouths, cup interiors).")
     parser.add_argument("--native-simplify-impl", choices=["metal", "fast"], default="metal",
                         help="Bridge: choice of simplifier — 'metal' = Pedro's port (default), "
                              "'fast' = fast_simplification CPU QEM (S17b test).")

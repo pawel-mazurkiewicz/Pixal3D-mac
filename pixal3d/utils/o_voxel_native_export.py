@@ -432,6 +432,51 @@ def _patch_presmooth_for_compute_charts(postprocess, mode: str, iterations: int)
     )
 
 
+def _patch_fill_holes_before_uv(postprocess, perimeter: float) -> None:
+    """OPTIONAL watertight enhancement (off by default; not faithful to CUDA).
+
+    The to_glb chain's last geometry op before uv_unwrap is the final
+    ``simplify``, which reopens thin-feature holes; the built-in
+    ``fill_holes(max_hole_perimeter=3e-2)`` passes run *earlier* and miss them,
+    so the holes survive into the atlas (xatlas counts charts on a holey mesh).
+
+    This wraps ``_MeshBackend.compute_charts`` to run one more
+    ``fill_holes(max_hole_perimeter=perimeter)`` in-place just before chart
+    computation.  Because it precedes UV unwrap + bake, the patch faces become
+    part of the atlas (they get UVs + sampled texture) and close boundary loops
+    so xatlas emits fewer charts.  Uses the backend's own (Metal) fill_holes —
+    the same op already used four times in the chain — with a larger perimeter.
+    """
+    if perimeter <= 0.0:
+        return
+    backend_cls = postprocess._MeshBackend
+    original = backend_cls.compute_charts
+
+    def _wrapped(self, *args, **kwargs):
+        try:
+            before_v, before_f = self.num_vertices, self.num_faces
+            self.fill_holes(max_hole_perimeter=perimeter)
+            print(
+                f"[o_voxel-native]   fill-holes-before-uv: perimeter={perimeter}, "
+                f"V {before_v:,}->{self.num_vertices:,} F {before_f:,}->{self.num_faces:,}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[o_voxel-native]   fill-holes-before-uv failed ({exc}); "
+                "proceeding without the extra fill",
+                flush=True,
+            )
+        return original(self, *args, **kwargs)
+
+    backend_cls.compute_charts = _wrapped
+    print(
+        f"[o_voxel-native] PATCH: fill-holes-before-uv on {backend_cls.__name__} "
+        f"(max_hole_perimeter={perimeter})",
+        flush=True,
+    )
+
+
 def _patch_simplify_fast(postprocess) -> None:
     """Replace ``_MeshBackend.simplify`` with ``fast_simplification`` (S17b).
 
@@ -1224,6 +1269,14 @@ def parse_args(argv=None):
                              "per-face normal perturbations (S17b root-cause fix).")
     parser.add_argument("--precharts-smooth-iterations", type=int, default=5,
                         help="Smoothing iterations (default 5).")
+    parser.add_argument("--fill-holes-before-uv-perimeter", type=float, default=0.0,
+                        help="OPTIONAL watertight enhancement (off when <=0; NOT faithful to the "
+                             "CUDA reference). Run an extra fill_holes on the final mesh right "
+                             "before compute_charts/uv_unwrap, closing thin-feature holes that the "
+                             "post-simplify chain's built-in 3e-2 fill misses. Because it runs "
+                             "pre-UV, the patches get UVs + texture and the chart count drops. "
+                             "Value is max_hole_perimeter (e.g. 0.1); larger closes bigger holes "
+                             "but may seal legitimate openings (mouths, cup interiors).")
     return parser.parse_args(argv)
 
 
@@ -1277,6 +1330,7 @@ def main(argv=None) -> int:
         mode=args.precharts_smooth,
         iterations=args.precharts_smooth_iterations,
     )
+    _patch_fill_holes_before_uv(postprocess, perimeter=args.fill_holes_before_uv_perimeter)
 
     vertices, faces, attrs, coords, aabb, resolution = _load_npz(Path(args.input))
     if args.verbose:
