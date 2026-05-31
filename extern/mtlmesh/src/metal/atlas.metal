@@ -8,6 +8,21 @@ inline ulong pack_kv(int key, float value) {
     return (ulong(v) << 32) | ulong(uint(key));
 }
 
+// Float atomics are not reliably available across older Apple GPU targets.
+// Emulate atomic add via a CAS loop on the underlying 32-bit representation.
+inline void atomicAddFloat(device atomic_uint* addr, float value) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    while (true) {
+        float current = as_type<float>(expected);
+        uint desired = as_type<uint>(current + value);
+        if (atomic_compare_exchange_weak_explicit(
+                addr, &expected, desired,
+                memory_order_relaxed, memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 // Initialize chart adjacency from face adjacency
 kernel void init_chart_adj_kernel(
     device const packed_float3* vertices [[buffer(0)]],
@@ -41,9 +56,29 @@ kernel void init_chart_adj_kernel(
     } else { length[tid] = 0; }
 }
 
-// Count chart-edge connectivity + accumulate perimeters
-// Uses atomic float add (Metal 3.0, Apple Silicon M1+)
+// Count chart-edge connectivity + accumulate perimeters.
+// Use CAS-based float accumulation instead of native atomic_float so the
+// kernel compiles on older Apple GPU targets such as M1.
 kernel void get_chart_edge_cnt_kernel(
+    device const ulong* chart_adj [[buffer(0)]],
+    device const float* chart_adj_length [[buffer(1)]],
+    constant int& E [[buffer(2)]],
+    device atomic_int* chart2edge_cnt [[buffer(3)]],
+    device atomic_uint* chart_perim [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= (uint)E) return;
+    ulong c = chart_adj[tid];
+    float l = chart_adj_length[tid];
+    int c0 = int(c >> 32), c1 = int(c & 0xFFFFFFFF);
+    atomic_fetch_add_explicit(&chart2edge_cnt[c0], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&chart2edge_cnt[c1], 1, memory_order_relaxed);
+    atomicAddFloat(&chart_perim[c0], l);
+    atomicAddFloat(&chart_perim[c1], l);
+}
+
+// Native-float-atomic variant for newer Apple GPU families.
+kernel void get_chart_edge_cnt_kernel_native(
     device const ulong* chart_adj [[buffer(0)]],
     device const float* chart_adj_length [[buffer(1)]],
     constant int& E [[buffer(2)]],

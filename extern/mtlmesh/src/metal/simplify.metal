@@ -157,6 +157,39 @@ kernel void propagate_cost_kernel(
     }
 }
 
+// Fallback for older Apple GPU targets: compute the propagated minimum cost
+// per face directly. The original kernel propagates each edge's cost to all
+// faces incident to either endpoint, so the face-local minimum is taken over
+// the union of edges adjacent to the face's three vertices.
+kernel void propagate_cost_per_face_kernel(
+    device const packed_int3* faces [[buffer(0)]],
+    device const int* vert2edge [[buffer(1)]],
+    device const int* vert2edge_offset [[buffer(2)]],
+    device const float* edge_collapse_costs [[buffer(3)]],
+    constant int& F [[buffer(4)]],
+    device ulong* propagated_costs [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= (uint)F) return;
+    int3 vids = to_int3(faces[tid]);
+    ulong best = ULONG_MAX;
+
+    for (int i = vert2edge_offset[vids.x]; i < vert2edge_offset[vids.x + 1]; i++) {
+        int eid = vert2edge[i];
+        best = min(best, pack_key_value_positive(eid, edge_collapse_costs[eid]));
+    }
+    for (int i = vert2edge_offset[vids.y]; i < vert2edge_offset[vids.y + 1]; i++) {
+        int eid = vert2edge[i];
+        best = min(best, pack_key_value_positive(eid, edge_collapse_costs[eid]));
+    }
+    for (int i = vert2edge_offset[vids.z]; i < vert2edge_offset[vids.z + 1]; i++) {
+        int eid = vert2edge[i];
+        best = min(best, pack_key_value_positive(eid, edge_collapse_costs[eid]));
+    }
+
+    propagated_costs[tid] = best;
+}
+
 // Collapse edges in parallel (conflict-free via propagated cost check)
 kernel void collapse_edges_kernel(
     device packed_float3* vertices [[buffer(0)]],

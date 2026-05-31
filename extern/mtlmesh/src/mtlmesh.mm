@@ -13,6 +13,24 @@ namespace mtlmesh {
 
 template<typename T> static inline T* PTR(id<MTLBuffer> buf) { return (T*)[buf contents]; }
 
+static const char* chart_edge_count_kernel_name(id<MTLDevice> device) {
+    if (@available(macOS 14.0, *)) {
+        if ([device supportsFamily:MTLGPUFamilyApple9]) {
+            return "get_chart_edge_cnt_kernel_native";
+        }
+    }
+    return "get_chart_edge_cnt_kernel";
+}
+
+static const char* simplify_propagate_kernel_name(id<MTLDevice> device) {
+    if (@available(macOS 14.0, *)) {
+        if ([device supportsFamily:MTLGPUFamilyApple9]) {
+            return "propagate_cost_kernel";
+        }
+    }
+    return "propagate_cost_per_face_kernel";
+}
+
 // ========== Buffer helpers ==========
 
 id<MTLBuffer> MtlMesh::alloc(size_t bytes) {
@@ -1200,6 +1218,8 @@ void MtlMesh::unify_face_orientations() {
 std::tuple<int, int> MtlMesh::simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing) {
     get_vertex_face_adjacency();
     get_edges();
+    get_edge_face_adjacency();
+    get_vertex_edge_adjacency();
     get_boundary_info();
 
     int V = num_verts, F = num_fcs, E = num_edges_;
@@ -1235,14 +1255,26 @@ std::tuple<int, int> MtlMesh::simplify_step(float lambda_edge_length, float lamb
     auto prop_costs = alloc(F * 8);
     memset([prop_costs contents], 0xFF, F * 8);  // UINT64_MAX
 
-    CTX.dispatch("propagate_cost_kernel", [&](id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:edges offset:0 atIndex:0];
-        [enc setBuffer:vert2face offset:0 atIndex:1];
-        [enc setBuffer:vert2face_offset offset:0 atIndex:2];
-        [enc setBuffer:costs offset:0 atIndex:3];
-        [enc setBytes:&E length:sizeof(int) atIndex:4];
-        [enc setBuffer:prop_costs offset:0 atIndex:5];
-    }, E);
+    const char* prop_kernel = simplify_propagate_kernel_name(dev_);
+    if (strcmp(prop_kernel, "propagate_cost_kernel") == 0) {
+        CTX.dispatch(prop_kernel, [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:edges offset:0 atIndex:0];
+            [enc setBuffer:vert2face offset:0 atIndex:1];
+            [enc setBuffer:vert2face_offset offset:0 atIndex:2];
+            [enc setBuffer:costs offset:0 atIndex:3];
+            [enc setBytes:&E length:sizeof(int) atIndex:4];
+            [enc setBuffer:prop_costs offset:0 atIndex:5];
+        }, E);
+    } else {
+        CTX.dispatch(prop_kernel, [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:faces offset:0 atIndex:0];
+            [enc setBuffer:vert2edge offset:0 atIndex:1];
+            [enc setBuffer:vert2edge_offset offset:0 atIndex:2];
+            [enc setBuffer:costs offset:0 atIndex:3];
+            [enc setBytes:&F length:sizeof(int) atIndex:4];
+            [enc setBuffer:prop_costs offset:0 atIndex:5];
+        }, F);
+    }
 
     // Step 4: Collapse edges
     auto vert_kept = alloc(V * 4);
@@ -1483,7 +1515,7 @@ void MtlMesh::compute_charts(float threshold, int refine_iters, int global_iters
         // Build chart-edge CSR adjacency
         auto chart2edge_cnt = alloc_zero(num_charts * 4);
         auto chart_perims = alloc_zero(num_charts * 4);
-        CTX.dispatch("get_chart_edge_cnt_kernel", [&](id<MTLComputeCommandEncoder> enc) {
+        CTX.dispatch(chart_edge_count_kernel_name(dev_), [&](id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:unique_adj offset:0 atIndex:0];
             [enc setBuffer:agg_lengths offset:0 atIndex:1];
             [enc setBytes:&chart_E length:sizeof(int) atIndex:2];
@@ -1610,7 +1642,7 @@ void MtlMesh::compute_charts(float threshold, int refine_iters, int global_iters
 
             chart2edge_cnt = alloc_zero(num_charts * 4);
             chart_perims = alloc_zero(num_charts * 4);
-            CTX.dispatch("get_chart_edge_cnt_kernel", [&](id<MTLComputeCommandEncoder> enc) {
+            CTX.dispatch(chart_edge_count_kernel_name(dev_), [&](id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:unique_adj offset:0 atIndex:0];
                 [enc setBuffer:agg_lengths offset:0 atIndex:1];
                 [enc setBytes:&chart_E length:sizeof(int) atIndex:2];
