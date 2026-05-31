@@ -65,10 +65,7 @@ small - intrinsic fp32-vs-TF32 reduction-order drift, minor thin-feature simplif
 
 ## Requirements
 
-- **Apple Silicon Mac** (M3 or newer). Intel Macs are not supported.
-Two kernels in mtlmesh use native float atomics that only exist on Apple9+ (M3 and newer):
-  - simplify.metal — atomic_min/atomic_max on floats
-  - atlas.metal — atomic_float
+- **Apple Silicon Mac** (M1 or newer). Intel Macs are not supported.
 - **macOS** recent enough to provide the Metal toolchain (tested on macOS 14+).
 - **Xcode Command Line Tools** — required. The vendored Metal packages compile
   `.metal` shaders to `.metallib` **at install time** using `xcrun metal`, so the
