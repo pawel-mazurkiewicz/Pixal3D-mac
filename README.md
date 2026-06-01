@@ -5,7 +5,7 @@
 ![alt text](assets/readme/image.png)
 
 **Unofficial fork that runs [Pixal3D](https://ldyang694.github.io/projects/pixal3d/) image-to-3D generation on Apple Silicon Macs — no CUDA required.**
-
+**And its [story](https://blog.chillaid.art/posts/porting-pixal3d-one-cursed-kernel-at-a-time) **
 </div>
 
 <div align="center">
