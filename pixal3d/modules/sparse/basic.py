@@ -280,7 +280,30 @@ class VarLenTensor:
         if dim is None or 0 in dim:
             return red
         
-        red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)
+        if red.device.type == 'mps':
+            # MPS has no aten::segment_reduce (pytorch#141287).  Express it with
+            # scatter ops that ARE MPS-native, so we stay on-device instead of
+            # falling back to CPU.  Equivalent to segment_reduce over dim 0.
+            lengths = self.seqlen.to(red.device)
+            n = lengths.shape[0]
+            seg = torch.repeat_interleave(torch.arange(n, device=red.device), lengths)
+            idx = seg.reshape(-1, *([1] * (red.ndim - 1))).expand_as(red)
+            if op == 'sum':
+                out = torch.zeros(n, *red.shape[1:], dtype=red.dtype, device=red.device)
+                out.scatter_add_(0, idx, red)
+            elif op == 'mean':
+                out = torch.zeros(n, *red.shape[1:], dtype=red.dtype, device=red.device)
+                out.scatter_add_(0, idx, red)
+                cnt = lengths.to(red.dtype).clamp(min=1).reshape(-1, *([1] * (red.ndim - 1)))
+                out = out / cnt
+            elif op == 'prod':
+                out = torch.ones(n, *red.shape[1:], dtype=red.dtype, device=red.device)
+                out.scatter_reduce_(0, idx, red, reduce='prod', include_self=True)
+            else:
+                raise ValueError(f"Unsupported reduce operation: {op}")
+            red = out
+        else:
+            red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)
         return red
     
     def mean(self, dim: Optional[Union[int, Tuple[int,...]]] = None, keepdim: bool = False) -> torch.Tensor:
