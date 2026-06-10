@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -1909,7 +1910,7 @@ def watchdog_help_message() -> str:
     )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Generate a Pixal3D GLB from one image on Apple Silicon MPS")
     parser.add_argument(
         "image",
@@ -2288,7 +2289,7 @@ def parse_args():
                              "QEM-induced per-face normal noise (S17b root-cause fix).")
     parser.add_argument("--native-precharts-smooth-iterations", type=int, default=5,
                         help="Bridge: smoothing iterations (default 5).")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 class _LoadedMesh:
@@ -2436,250 +2437,255 @@ def reextract_mesh_from_fdg(mesh, resolution: int):
     return mesh, vertices, faces
 
 
-def main():
-    args = parse_args()
-    _configure_fdg_environment(args)
-    glb_path = output_glb_path(args.output)
-    glb_path.parent.mkdir(parents=True, exist_ok=True)
+@dataclass
+class Pixal3DAsset:
+    """Hand-off object between generation and GLB export.
 
-    load_runtime_deps()
-    if PIXAL3D_DUMP_FIXTURES:
-        _dump_run_metadata(PIXAL3D_DUMP_FIXTURES, image_path=args.image or "",
-                           args_dict=vars(args), seed=args.seed)
-    device = resolve_device(args.device)
+    ``mesh`` is the raw pipeline mesh (carries ``.attrs``/``.coords`` voxel data
+    when textured); ``vertices``/``faces`` are the numpy copies the export path
+    consumes.  ``camera_info`` is the MoGe/manual-FOV camera dict (None for the
+    checkpoint/fixture load paths).  This is the value the ComfyUI ``PIXAL3D_ASSET``
+    type wraps.
+    """
+    mesh: object
+    vertices: np.ndarray
+    faces: np.ndarray
+    resolution: int
+    has_voxels: bool
+    camera_info: dict | None = None
 
-    print("=" * 60)
-    print("Pixal3D Apple Silicon CLI")
-    print("=" * 60)
-    print(f"Device: {device}")
-    print(f"Sparse conv backend: {os.environ.get('SPARSE_CONV_BACKEND')}")
-    print(f"Sparse attention backend: {os.environ.get('SPARSE_ATTN_BACKEND')}")
 
-    t0 = time.time()
-    pipeline = None
-    from_checkpoint = bool(args.load_mesh)
-    from_fixture = bool(args.load_fixture_07)
+def _mesh_has_voxels(mesh) -> bool:
+    return (hasattr(mesh, "attrs") and mesh.attrs is not None
+            and hasattr(mesh, "coords") and mesh.coords is not None)
 
-    if from_fixture:
-        fx_path = Path(args.load_fixture_07)
-        if not fx_path.exists():
-            raise SystemExit(f"Stage-07 fixture not found: {fx_path}")
-        print(f"[Fixture-07] Loading mesh from {fx_path}")
-        mesh, vertices, faces, resolution = load_stage_07_fixture(
-            fx_path, resolution=1024)
-        print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles "
-              f"(resolution={resolution}) — skipping upstream pipeline.")
-    elif from_checkpoint:
-        ckpt_path = Path(args.load_mesh)
-        if not ckpt_path.exists():
-            raise SystemExit(f"Mesh checkpoint not found: {ckpt_path}")
-        print(f"[Checkpoint] Loading mesh from {ckpt_path}")
-        mesh, vertices, faces, resolution = load_mesh_checkpoint(ckpt_path)
-        if args.reextract_mesh_from_fdg:
-            mesh, vertices, faces = reextract_mesh_from_fdg(mesh, resolution)
-        print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles "
-              f"(resolution={resolution})")
+
+def load_pipeline(args, device=None):
+    """Load the Pixal3D pipeline (+ optional texture PBR recalibration).
+
+    Mirrors the model-loading block of ``main()``.  Returns a pipeline ready for
+    :func:`image_to_asset`.  Importable entry point for the ComfyUI model-loader
+    node.
+    """
+    if device is None:
+        device = resolve_device(args.device)
+    pipeline = init_pipeline(args.model_path, device)
+
+    if getattr(args, "tex_recalib", False) or getattr(args, "tex_sat_boost", 1.0) != 1.0:
+        _install_tex_pbr_recalib(
+            pipeline,
+            recalib_metallic=bool(getattr(args, "tex_recalib", False)),
+            metallic_mean=float(getattr(args, "tex_metallic_mean", 0.0002)),
+            metallic_std=float(getattr(args, "tex_metallic_std", 0.001)),
+            sat_boost=float(getattr(args, "tex_sat_boost", 1.0)),
+        )
+    return pipeline
+
+
+def image_to_asset(pipeline, image, args, device=None, *, tmp_dir=None) -> Pixal3DAsset:
+    """Preprocess ``image`` -> estimate camera -> run pipeline -> extract mesh.
+
+    ``image`` is a PIL image.  ``tmp_dir`` is where MoGe's temporary PNG is
+    written (defaults to the system temp dir; the CLI passes the output GLB's
+    parent so behaviour is unchanged).  Returns a :class:`Pixal3DAsset`.
+    Importable entry point for the ComfyUI image-to-3D node.
+    """
+    if device is None:
+        device = resolve_device(args.device)
+    tmp_dir = Path(tmp_dir) if tmp_dir is not None else Path(tempfile.gettempdir())
+
+    image_preprocessed = pipeline.preprocess_image(image)
+    _dump_fixture("00_preprocessed_image", {
+        "mode": image_preprocessed.mode,
+        "size": image_preprocessed.size,
+        "pixels": np.array(image_preprocessed),
+    })
+
+    if args.fov > 0:
+        # Manual FOV: bypass MoGe entirely.  Matches the formula used by
+        # Pixal3D_fresh/inference.py so CUDA-vs-MPS captures stay aligned.
+        camera_angle_x = float(args.fov)
+        grid_point = torch.tensor([-1.0, 0.0, 0.0])
+        target_point = torch.tensor(
+            [0 - args.extend_pixel,
+             args.image_resolution - 1 + args.extend_pixel]
+        )
+        distance = distance_from_fov(
+            camera_angle_x, grid_point, target_point,
+            args.mesh_scale, args.image_resolution,
+        )["distance_from_x"]
+        camera_params = {
+            "camera_angle_x": camera_angle_x,
+            "distance": distance,
+            "mesh_scale": args.mesh_scale,
+        }
+        print(f"[Manual FOV] {math.degrees(args.fov):.2f}° "
+              f"({args.fov:.4f} rad), distance={distance:.4f}")
     else:
-        if not args.image:
-            raise SystemExit(
-                "An input image is required unless --load-mesh PATH or "
-                "--load-fixture-07 PATH is given"
-            )
-        input_path = Path(args.image)
-        if not input_path.exists():
-            raise SystemExit(f"Input image not found: {input_path}")
-
-        pipeline = init_pipeline(args.model_path, device)
-
-        if getattr(args, "tex_recalib", False) or getattr(args, "tex_sat_boost", 1.0) != 1.0:
-            _install_tex_pbr_recalib(
-                pipeline,
-                recalib_metallic=bool(getattr(args, "tex_recalib", False)),
-                metallic_mean=float(getattr(args, "tex_metallic_mean", 0.0002)),
-                metallic_std=float(getattr(args, "tex_metallic_std", 0.001)),
-                sat_boost=float(getattr(args, "tex_sat_boost", 1.0)),
-            )
-
-        print(f"[Input] {input_path}")
-        image = Image.open(input_path)
-        image_preprocessed = pipeline.preprocess_image(image)
-        _dump_fixture("00_preprocessed_image", {
-            "mode": image_preprocessed.mode,
-            "size": image_preprocessed.size,
-            "pixels": np.array(image_preprocessed),
-        })
-
-        if args.fov > 0:
-            # Manual FOV: bypass MoGe entirely.  Matches the formula used by
-            # Pixal3D_fresh/inference.py so CUDA-vs-MPS captures stay aligned.
-            camera_angle_x = float(args.fov)
-            grid_point = torch.tensor([-1.0, 0.0, 0.0])
-            target_point = torch.tensor(
-                [0 - args.extend_pixel,
-                 args.image_resolution - 1 + args.extend_pixel]
-            )
-            distance = distance_from_fov(
-                camera_angle_x, grid_point, target_point,
-                args.mesh_scale, args.image_resolution,
-            )["distance_from_x"]
-            camera_params = {
-                "camera_angle_x": camera_angle_x,
-                "distance": distance,
-                "mesh_scale": args.mesh_scale,
-            }
-            print(f"[Manual FOV] {math.degrees(args.fov):.2f}° "
-                  f"({args.fov:.4f} rad), distance={distance:.4f}")
-        else:
-            print("[MoGe] Loading camera estimator...")
-            moge_model = load_moge_model(device)
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=str(glb_path.parent))
-            tmp_path = Path(tmp_file.name)
-            tmp_file.close()
-            try:
-                image_preprocessed.save(tmp_path)
-                print("[MoGe] Estimating camera parameters...")
-                camera_params = get_camera_params_wild_moge(
-                    tmp_path,
-                    moge_model,
-                    device=device,
-                    mesh_scale=args.mesh_scale,
-                    extend_pixel=args.extend_pixel,
-                    image_resolution=args.image_resolution,
-                )
-            finally:
-                try:
-                    tmp_path.unlink()
-                except FileNotFoundError:
-                    pass
-            del moge_model
-            maybe_empty_cache(device)
-            print(f"[MoGe] camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
-
-        _dump_fixture("01_camera_params", camera_params)
-
-        torch.manual_seed(args.seed)
-        print(f"[Generate] pipeline={args.pipeline_type}, seed={args.seed}")
-
-        # --- PIXAL3D_CUDA_SUBSTITUTE: inject CUDA fixtures at named pipeline ----
-        # stages, bypassing the Mac producer for that stage (Session 15
-        # bisection harness).  Install BEFORE the fixture-dump hooks so that
-        # subsequent dumps capture the substituted output for verification.
-        # See scripts/cuda_substitute.py for stage names and usage.
-        if os.environ.get("PIXAL3D_CUDA_SUBSTITUTE", "").strip():
-            import sys as _sys
-            _scripts_dir = str(Path(__file__).resolve().parent / "scripts")
-            if _scripts_dir not in _sys.path:
-                _sys.path.insert(0, _scripts_dir)
-            try:
-                from cuda_substitute import install_from_env  # type: ignore
-                install_from_env(pipeline, verbose=True)
-            except Exception as exc:
-                print(f"[cuda-sub] ERROR: install_from_env failed: {exc}", flush=True)
-
-        # --- PIXAL3D_HR_SLAT_INJECT: monkey-patch shape_slat_sampler.sample to
-        # return a pre-computed HR shape SLAT (typically from CUDA capture),
-        # bypassing Mac's HR DiT.  Used together with PIXAL3D_CUDA_SUBSTITUTE
-        # for 03a to fully bypass both DiT stages and isolate decoder-only
-        # divergence.  The injected slat must be a SparseTensor pickle.
-        _hr_inject_path = os.environ.get("PIXAL3D_HR_SLAT_INJECT", "").strip()
-        if _hr_inject_path:
-            try:
-                hr_slat_loaded = torch.load(_hr_inject_path, map_location="cpu", weights_only=False)
-                if isinstance(hr_slat_loaded, dict) and "pred_x_0" in hr_slat_loaded:
-                    hr_slat_loaded = hr_slat_loaded["pred_x_0"]
-                # Drain _spatial_cache — CPU-loaded SparseTensors carry stale CPU
-                # index tensors that break MPS sparse attention later in the
-                # pipeline (e.g. texture sampler's RoPE).  Cache rebuilds lazily
-                # on first MPS sparse-conv access on the new device.
-                if hasattr(hr_slat_loaded, "_spatial_cache") and isinstance(hr_slat_loaded._spatial_cache, dict):
-                    hr_slat_loaded._spatial_cache = {}
-                print(f"[hr-inject] Loaded HR slat from {_hr_inject_path}: feats {hr_slat_loaded.feats.shape} coords {hr_slat_loaded.coords.shape}", flush=True)
-                _orig_sampler_sample = pipeline.shape_slat_sampler.sample
-                _hr_inject_state = {"call_count": 0}
-
-                def _patched_sampler_sample(*args, **kwargs):
-                    n = _hr_inject_state["call_count"]
-                    _hr_inject_state["call_count"] += 1
-                    desc = kwargs.get("tqdm_desc", "")
-                    if "HR" in desc or n > 0:
-                        # HR sampling call (or any call after the first) — substitute
-                        print(f"[hr-inject] Intercepting sampler.sample (desc={desc!r}, call {n}) — returning loaded HR slat", flush=True)
-                        slat = hr_slat_loaded.to(device) if hasattr(hr_slat_loaded, 'to') else hr_slat_loaded
-                        # Drain cache again after device move
-                        if hasattr(slat, "_spatial_cache") and isinstance(slat._spatial_cache, dict):
-                            slat._spatial_cache = {}
-                        class _MockResult:
-                            samples = slat
-                        return _MockResult()
-                    return _orig_sampler_sample(*args, **kwargs)
-                pipeline.shape_slat_sampler.sample = _patched_sampler_sample
-                print(f"[hr-inject] Installed sampler.sample monkey-patch.", flush=True)
-            except Exception as exc:
-                print(f"[hr-inject] ERROR: {exc}", flush=True)
-
-        if PIXAL3D_DUMP_FIXTURES:
-            _install_pipeline_fixture_hooks(pipeline, PIXAL3D_DUMP_FIXTURES)
-
-        # PIXAL3D_SDPA_BACKEND=math|efficient|flash pins torch's SDPA path
-        # for this run.  Lets us isolate whether MPS's fused attention paths
-        # are the source of CUDA-vs-MPS divergence.  Unset = backend default.
-        _sdpa_choice = os.environ.get("PIXAL3D_SDPA_BACKEND", "").strip().lower()
-        _sdpa_ctx = nullcontext()
-        if _sdpa_choice:
-            try:
-                import torch.nn.attention as _ta
-                _sdpa_map = {
-                    "math":      _ta.SDPBackend.MATH,
-                    "efficient": _ta.SDPBackend.EFFICIENT_ATTENTION,
-                    "flash":     _ta.SDPBackend.FLASH_ATTENTION,
-                }
-                if _sdpa_choice in _sdpa_map:
-                    _sdpa_ctx = _ta.sdpa_kernel([_sdpa_map[_sdpa_choice]])
-                    print(f"[SDPA] pinning attention to '{_sdpa_choice}'", flush=True)
-                else:
-                    print(f"[SDPA] WARN unknown PIXAL3D_SDPA_BACKEND='{_sdpa_choice}'; using default", flush=True)
-            except Exception as _exc:
-                print(f"[SDPA] WARN sdpa_kernel unavailable ({_exc}); using default", flush=True)
-
-        t_gen = time.time()
+        print("[MoGe] Loading camera estimator...")
+        moge_model = load_moge_model(device)
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=str(tmp_dir))
+        tmp_path = Path(tmp_file.name)
+        tmp_file.close()
         try:
-          with _sdpa_ctx:
-            mesh_list, (shape_slat, tex_slat, resolution) = pipeline.run(
-                image_preprocessed,
-                camera_params=camera_params,
-                seed=args.seed,
-                sparse_structure_sampler_params=sampler_overrides(args, "ss"),
-                shape_slat_sampler_params=sampler_overrides(args, "shape"),
-                tex_slat_sampler_params=sampler_overrides(args, "tex"),
-                preprocess_image=False,
-                return_latent=True,
-                pipeline_type=args.pipeline_type,
-                max_num_tokens=args.max_num_tokens,
+            image_preprocessed.save(tmp_path)
+            print("[MoGe] Estimating camera parameters...")
+            camera_params = get_camera_params_wild_moge(
+                tmp_path,
+                moge_model,
+                device=device,
+                mesh_scale=args.mesh_scale,
+                extend_pixel=args.extend_pixel,
+                image_resolution=args.image_resolution,
             )
-        except (IndexError, AssertionError) as exc:
-            if any(sig in str(exc) for sig in ("non-zero size", "BVH needs at least 8 triangles")):
-                print(watchdog_help_message())
-                sys.exit(2)
-            raise
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+        del moge_model
+        maybe_empty_cache(device)
+        print(f"[MoGe] camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
 
-        mesh = mesh_list[0]
-        _dump_fixture("07_run_output", {
-            "mesh": mesh,
-            "shape_slat": shape_slat,
-            "tex_slat": tex_slat,
-            "res": resolution,
-        })
-        vertices = mesh.vertices.detach().cpu().numpy()
-        faces = mesh.faces.detach().cpu().numpy()
-        if vertices.shape[0] == 0 or faces.shape[0] == 0:
+    _dump_fixture("01_camera_params", camera_params)
+
+    torch.manual_seed(args.seed)
+    print(f"[Generate] pipeline={args.pipeline_type}, seed={args.seed}")
+
+    # --- PIXAL3D_CUDA_SUBSTITUTE: inject CUDA fixtures at named pipeline ----
+    # stages, bypassing the Mac producer for that stage (Session 15
+    # bisection harness).  Install BEFORE the fixture-dump hooks so that
+    # subsequent dumps capture the substituted output for verification.
+    # See scripts/cuda_substitute.py for stage names and usage.
+    if os.environ.get("PIXAL3D_CUDA_SUBSTITUTE", "").strip():
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        try:
+            from cuda_substitute import install_from_env  # type: ignore
+            install_from_env(pipeline, verbose=True)
+        except Exception as exc:
+            print(f"[cuda-sub] ERROR: install_from_env failed: {exc}", flush=True)
+
+    # --- PIXAL3D_HR_SLAT_INJECT: monkey-patch shape_slat_sampler.sample to
+    # return a pre-computed HR shape SLAT (typically from CUDA capture),
+    # bypassing Mac's HR DiT.  Used together with PIXAL3D_CUDA_SUBSTITUTE
+    # for 03a to fully bypass both DiT stages and isolate decoder-only
+    # divergence.  The injected slat must be a SparseTensor pickle.
+    _hr_inject_path = os.environ.get("PIXAL3D_HR_SLAT_INJECT", "").strip()
+    if _hr_inject_path:
+        try:
+            hr_slat_loaded = torch.load(_hr_inject_path, map_location="cpu", weights_only=False)
+            if isinstance(hr_slat_loaded, dict) and "pred_x_0" in hr_slat_loaded:
+                hr_slat_loaded = hr_slat_loaded["pred_x_0"]
+            # Drain _spatial_cache — CPU-loaded SparseTensors carry stale CPU
+            # index tensors that break MPS sparse attention later in the
+            # pipeline (e.g. texture sampler's RoPE).  Cache rebuilds lazily
+            # on first MPS sparse-conv access on the new device.
+            if hasattr(hr_slat_loaded, "_spatial_cache") and isinstance(hr_slat_loaded._spatial_cache, dict):
+                hr_slat_loaded._spatial_cache = {}
+            print(f"[hr-inject] Loaded HR slat from {_hr_inject_path}: feats {hr_slat_loaded.feats.shape} coords {hr_slat_loaded.coords.shape}", flush=True)
+            _orig_sampler_sample = pipeline.shape_slat_sampler.sample
+            _hr_inject_state = {"call_count": 0}
+
+            def _patched_sampler_sample(*args, **kwargs):
+                n = _hr_inject_state["call_count"]
+                _hr_inject_state["call_count"] += 1
+                desc = kwargs.get("tqdm_desc", "")
+                if "HR" in desc or n > 0:
+                    # HR sampling call (or any call after the first) — substitute
+                    print(f"[hr-inject] Intercepting sampler.sample (desc={desc!r}, call {n}) — returning loaded HR slat", flush=True)
+                    slat = hr_slat_loaded.to(device) if hasattr(hr_slat_loaded, 'to') else hr_slat_loaded
+                    # Drain cache again after device move
+                    if hasattr(slat, "_spatial_cache") and isinstance(slat._spatial_cache, dict):
+                        slat._spatial_cache = {}
+                    class _MockResult:
+                        samples = slat
+                    return _MockResult()
+                return _orig_sampler_sample(*args, **kwargs)
+            pipeline.shape_slat_sampler.sample = _patched_sampler_sample
+            print(f"[hr-inject] Installed sampler.sample monkey-patch.", flush=True)
+        except Exception as exc:
+            print(f"[hr-inject] ERROR: {exc}", flush=True)
+
+    if PIXAL3D_DUMP_FIXTURES:
+        _install_pipeline_fixture_hooks(pipeline, PIXAL3D_DUMP_FIXTURES)
+
+    # PIXAL3D_SDPA_BACKEND=math|efficient|flash pins torch's SDPA path
+    # for this run.  Lets us isolate whether MPS's fused attention paths
+    # are the source of CUDA-vs-MPS divergence.  Unset = backend default.
+    _sdpa_choice = os.environ.get("PIXAL3D_SDPA_BACKEND", "").strip().lower()
+    _sdpa_ctx = nullcontext()
+    if _sdpa_choice:
+        try:
+            import torch.nn.attention as _ta
+            _sdpa_map = {
+                "math":      _ta.SDPBackend.MATH,
+                "efficient": _ta.SDPBackend.EFFICIENT_ATTENTION,
+                "flash":     _ta.SDPBackend.FLASH_ATTENTION,
+            }
+            if _sdpa_choice in _sdpa_map:
+                _sdpa_ctx = _ta.sdpa_kernel([_sdpa_map[_sdpa_choice]])
+                print(f"[SDPA] pinning attention to '{_sdpa_choice}'", flush=True)
+            else:
+                print(f"[SDPA] WARN unknown PIXAL3D_SDPA_BACKEND='{_sdpa_choice}'; using default", flush=True)
+        except Exception as _exc:
+            print(f"[SDPA] WARN sdpa_kernel unavailable ({_exc}); using default", flush=True)
+
+    try:
+      with _sdpa_ctx:
+        mesh_list, (shape_slat, tex_slat, resolution) = pipeline.run(
+            image_preprocessed,
+            camera_params=camera_params,
+            seed=args.seed,
+            sparse_structure_sampler_params=sampler_overrides(args, "ss"),
+            shape_slat_sampler_params=sampler_overrides(args, "shape"),
+            tex_slat_sampler_params=sampler_overrides(args, "tex"),
+            preprocess_image=False,
+            return_latent=True,
+            pipeline_type=args.pipeline_type,
+            max_num_tokens=args.max_num_tokens,
+        )
+    except (IndexError, AssertionError) as exc:
+        if any(sig in str(exc) for sig in ("non-zero size", "BVH needs at least 8 triangles")):
             print(watchdog_help_message())
             sys.exit(2)
+        raise
 
-        print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles")
-        print(f"[Timing] Generation: {time.time() - t_gen:.1f}s")
+    mesh = mesh_list[0]
+    _dump_fixture("07_run_output", {
+        "mesh": mesh,
+        "shape_slat": shape_slat,
+        "tex_slat": tex_slat,
+        "res": resolution,
+    })
+    vertices = mesh.vertices.detach().cpu().numpy()
+    faces = mesh.faces.detach().cpu().numpy()
+    if vertices.shape[0] == 0 or faces.shape[0] == 0:
+        print(watchdog_help_message())
+        sys.exit(2)
 
-        if args.save_mesh:
-            save_mesh_checkpoint(args.save_mesh, mesh, vertices, faces, resolution)
+    return Pixal3DAsset(
+        mesh=mesh, vertices=vertices, faces=faces, resolution=resolution,
+        has_voxels=_mesh_has_voxels(mesh), camera_info=camera_params,
+    )
+
+
+def asset_to_glb(asset, glb_path, args):
+    """Export a :class:`Pixal3DAsset` to a GLB at ``glb_path``.
+
+    Mirrors the export block of ``main()`` (optional NME pre-clean, then the
+    geometry-only / native o_voxel / fallback-texture export chain).  Returns
+    the written GLB path.  Importable entry point for the ComfyUI save-GLB node.
+    """
+    glb_path = Path(glb_path)
+    glb_path.parent.mkdir(parents=True, exist_ok=True)
+    mesh = asset.mesh
+    vertices = asset.vertices
+    faces = asset.faces
+    resolution = asset.resolution
+    has_voxels = asset.has_voxels
 
     # PIXAL3D_PRECLEAN_NME=1 runs repair_non_manifold_edges on the FDG-
     # extracted mesh BEFORE to_glb's cleanup chain.  The FDG output has
@@ -2704,7 +2710,6 @@ def main():
             mesh.vertices = torch.from_numpy(new_v).to(mesh.vertices.device).to(mesh.vertices.dtype)
             mesh.faces = torch.from_numpy(new_f).to(mesh.faces.device).to(mesh.faces.dtype)
 
-    has_voxels = hasattr(mesh, "attrs") and mesh.attrs is not None and hasattr(mesh, "coords") and mesh.coords is not None
     if args.no_texture or not has_voxels:
         export_geometry_only(vertices, faces, glb_path)
     elif not try_export_native_o_voxel_glb(mesh, resolution, vertices, faces, glb_path, args):
@@ -2712,6 +2717,77 @@ def main():
 
     if not glb_path.exists() or glb_path.stat().st_size == 0:
         raise SystemExit(f"Export failed: GLB was not written or is empty: {glb_path}")
+    return glb_path
+
+
+def main():
+    args = parse_args()
+    _configure_fdg_environment(args)
+    glb_path = output_glb_path(args.output)
+    glb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    load_runtime_deps()
+    if PIXAL3D_DUMP_FIXTURES:
+        _dump_run_metadata(PIXAL3D_DUMP_FIXTURES, image_path=args.image or "",
+                           args_dict=vars(args), seed=args.seed)
+    device = resolve_device(args.device)
+
+    print("=" * 60)
+    print("Pixal3D Apple Silicon CLI")
+    print("=" * 60)
+    print(f"Device: {device}")
+    print(f"Sparse conv backend: {os.environ.get('SPARSE_CONV_BACKEND')}")
+    print(f"Sparse attention backend: {os.environ.get('SPARSE_ATTN_BACKEND')}")
+
+    t0 = time.time()
+    from_checkpoint = bool(args.load_mesh)
+    from_fixture = bool(args.load_fixture_07)
+
+    if from_fixture:
+        fx_path = Path(args.load_fixture_07)
+        if not fx_path.exists():
+            raise SystemExit(f"Stage-07 fixture not found: {fx_path}")
+        print(f"[Fixture-07] Loading mesh from {fx_path}")
+        mesh, vertices, faces, resolution = load_stage_07_fixture(
+            fx_path, resolution=1024)
+        print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles "
+              f"(resolution={resolution}) — skipping upstream pipeline.")
+        asset = Pixal3DAsset(mesh, vertices, faces, resolution, _mesh_has_voxels(mesh))
+    elif from_checkpoint:
+        ckpt_path = Path(args.load_mesh)
+        if not ckpt_path.exists():
+            raise SystemExit(f"Mesh checkpoint not found: {ckpt_path}")
+        print(f"[Checkpoint] Loading mesh from {ckpt_path}")
+        mesh, vertices, faces, resolution = load_mesh_checkpoint(ckpt_path)
+        if args.reextract_mesh_from_fdg:
+            mesh, vertices, faces = reextract_mesh_from_fdg(mesh, resolution)
+        print(f"[Mesh] {vertices.shape[0]:,} vertices, {faces.shape[0]:,} triangles "
+              f"(resolution={resolution})")
+        asset = Pixal3DAsset(mesh, vertices, faces, resolution, _mesh_has_voxels(mesh))
+    else:
+        if not args.image:
+            raise SystemExit(
+                "An input image is required unless --load-mesh PATH or "
+                "--load-fixture-07 PATH is given"
+            )
+        input_path = Path(args.image)
+        if not input_path.exists():
+            raise SystemExit(f"Input image not found: {input_path}")
+
+        pipeline = load_pipeline(args, device)
+
+        print(f"[Input] {input_path}")
+        image = Image.open(input_path)
+        t_gen = time.time()
+        asset = image_to_asset(pipeline, image, args, device, tmp_dir=glb_path.parent)
+
+        print(f"[Mesh] {asset.vertices.shape[0]:,} vertices, {asset.faces.shape[0]:,} triangles")
+        print(f"[Timing] Generation: {time.time() - t_gen:.1f}s")
+
+        if args.save_mesh:
+            save_mesh_checkpoint(args.save_mesh, asset.mesh, asset.vertices, asset.faces, asset.resolution)
+
+    asset_to_glb(asset, glb_path, args)
 
     print(f"[Done] GLB saved to {glb_path} ({glb_path.stat().st_size:,} bytes)")
     print(f"[Timing] Total: {time.time() - t0:.1f}s")
