@@ -120,6 +120,15 @@ link-time / rpath quirks that PEP 517's isolated build environment doesn't satis
 See [`extern/README.md`](extern/README.md) for what each vendored package provides
 and how it maps to the CUDA dependency it replaces.
 
+### Running under ComfyUI
+
+Prefer a node graph? The **[ComfyUI-Pixal3D-MPS](https://github.com/pawel-mazurkiewicz/ComfyUI-Pixal3D-MPS)**
+custom-node pack drives this pipeline from ComfyUI. It imports `generate_mps`
+from a checkout of this repo, so the backend (deps + the six Metal externs) must
+be installed into **ComfyUI's own Python environment** — use
+[`requirements-comfyui.txt`](requirements-comfyui.txt), which leaves ComfyUI's
+`torch`/`numpy` untouched. Full steps are in that node pack's README.
+
 ## Usage
 
 Generate a textured GLB from a single image:
