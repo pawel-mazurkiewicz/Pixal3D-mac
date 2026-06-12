@@ -817,6 +817,43 @@ def maybe_empty_cache(device: torch.device):
         torch.mps.empty_cache()
 
 
+def _install_low_vram_hooks(pipeline, device: torch.device):
+    """Low-VRAM mode (opt-in): release the allocator cache after each heavy
+    pipeline stage so the *peak* reserved memory drops. Helps the pipeline fit on
+    smaller unified-memory Macs; costs some re-allocation latency, so it is gated
+    behind args.low_vram (off by default). Wraps the stage methods on the pipeline
+    instance, so it works regardless of how run() invokes them internally.
+    """
+    import functools
+
+    stage_methods = (
+        "sample_sparse_structure",
+        "sample_shape_slat",
+        "sample_shape_slat_cascade",
+        "decode_shape_slat",
+        "sample_tex_slat",
+        "decode_tex_slat",
+    )
+    wrapped = []
+    for name in stage_methods:
+        fn = getattr(pipeline, name, None)
+        if fn is None or getattr(fn, "_low_vram_wrapped", False):
+            continue
+
+        @functools.wraps(fn)
+        def wrapper(*a, __fn=fn, **k):
+            out = __fn(*a, **k)
+            maybe_empty_cache(device)
+            return out
+
+        wrapper._low_vram_wrapped = True
+        setattr(pipeline, name, wrapper)
+        wrapped.append(name)
+    if wrapped:
+        print(f"[low-vram] empty_cache after stages: {', '.join(wrapped)}", flush=True)
+    return wrapped
+
+
 def build_image_cond_model(config: dict, device: torch.device):
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
 
@@ -2516,6 +2553,9 @@ def image_to_asset(pipeline, image, args, device=None, *, tmp_dir=None) -> Pixal
     if device is None:
         device = resolve_device(args.device)
     tmp_dir = Path(tmp_dir) if tmp_dir is not None else Path(tempfile.gettempdir())
+
+    if getattr(args, "low_vram", False):
+        _install_low_vram_hooks(pipeline, device)
 
     image_preprocessed = pipeline.preprocess_image(image)
     _dump_fixture("00_preprocessed_image", {
