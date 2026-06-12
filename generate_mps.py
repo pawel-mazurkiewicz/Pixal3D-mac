@@ -563,7 +563,17 @@ def _configure_mps_environment():
     # backend computes attention as chunked fp32 matmul+softmax, which matches
     # CPU/CUDA to ~1e-6 (verified op-by-op).  Dense image-cond attention keeps sdpa
     # (proven faithful, S25).
-    os.environ.setdefault("SPARSE_ATTN_BACKEND", "naive")
+    # S26 follow-up: if the mtlflashattn shim is installed, `import flash_attn`
+    # resolves on MPS and the stock 'flash_attn' backend runs a Metal flash
+    # kernel — fp32-accumulated, validated against the chunked-fp32 reference
+    # to ~5e-4 at 1k-32k tokens, and ~6.7x faster than 'naive'
+    # (mtlflashattn/dev/probe_pixal3d.py).  Falls back to 'naive' otherwise.
+    if "SPARSE_ATTN_BACKEND" not in os.environ:
+        try:
+            import flash_attn  # noqa: F401  (mtlflashattn guarded shim on MPS)
+            os.environ["SPARSE_ATTN_BACKEND"] = "flash_attn"
+        except ImportError:
+            os.environ["SPARSE_ATTN_BACKEND"] = "naive"
     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
     os.environ.setdefault("FLEX_GEMM_AUTOTUNE_CACHE_PATH", str(ROOT / "autotune_cache.json"))
     os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "0")
@@ -1933,6 +1943,17 @@ def parse_args(argv=None):
     parser.add_argument("--output", default="output_3d", help="Output GLB path or basename (default: output_3d)")
     parser.add_argument("--model-path", default=MODEL_PATH, help="Pixal3D model path or Hugging Face repo")
     parser.add_argument("--device", choices=["mps", "cpu"], default="mps", help="Runtime device (default: mps)")
+    parser.add_argument(
+        "--flash-sdpa",
+        dest="flash_sdpa",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Route the dense 'sdpa' attention backend (F.scaled_dot_product_attention) "
+             "through the mtlflashattn Metal kernel via its gated patch. Fires on long "
+             "sequences (correctness: MPS fused SDPA is numerically wrong past ~4k tokens) "
+             "and fast TensorOps tiers (speed, 3-4x). Opt-in; default off (stock MPS SDPA). "
+             "Sparse attention already uses flash_attn via SPARSE_ATTN_BACKEND.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     parser.add_argument("--fov", type=float, default=-1.0,
                         help="Manual camera FOV in radians.  >0 bypasses MoGe-2 entirely "
@@ -2310,8 +2331,10 @@ def save_mesh_checkpoint(path, mesh, vertices, faces, resolution):
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     _write_mesh_npz(out, mesh, vertices, faces, resolution)
-    size_mb = out.stat().st_size / 1e6
-    print(f"[Checkpoint] Saved mesh to {out} ({size_mb:.1f} MB)")
+    # np.savez appends ".npz" when the path lacks it, so stat the real file.
+    written = out if out.suffix == ".npz" else out.with_name(out.name + ".npz")
+    size_mb = written.stat().st_size / 1e6
+    print(f"[Checkpoint] Saved mesh to {written} ({size_mb:.1f} MB)")
 
 
 def load_mesh_checkpoint(path):
@@ -2722,6 +2745,21 @@ def asset_to_glb(asset, glb_path, args):
 
 def main():
     args = parse_args()
+    if getattr(args, "flash_sdpa", False):
+        try:
+            from metal_flash_attn import sdpa as _mfa_sdpa
+            if _mfa_sdpa.install():
+                print(
+                    "[flash-sdpa] mtlflashattn SDPA patch installed "
+                    f"(correctness>={os.environ.get('MTLFLASHATTN_SDPA_MIN_SEQ', '4096')} tok, "
+                    f"fast-tier>={os.environ.get('MTLFLASHATTN_SDPA_FAST_MIN_SEQ', '1024')} tok, "
+                    f"oom>={os.environ.get('MTLFLASHATTN_SDPA_MIN_GB', '12')} GB)",
+                    flush=True,
+                )
+            else:
+                print("[flash-sdpa] SDPA patch not installed (kill switch set or already active)", flush=True)
+        except ImportError:
+            print("[flash-sdpa] mtlflashattn not available; dense attention stays on stock MPS SDPA", flush=True)
     _configure_fdg_environment(args)
     glb_path = output_glb_path(args.output)
     glb_path.parent.mkdir(parents=True, exist_ok=True)
